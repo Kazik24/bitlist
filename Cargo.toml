@@ -1,0 +1,25 @@
+[package]
+name = "bitlist"
+version = "0.0.1"
+edition = "2024"
+authors = ["Kazik24 <kazik24official@gmail.com>"]
+readme = "README.md"
+description = "Word-sized bit list implementation with bigint functionality"
+documentation = "https://docs.rs/bitlist/latest/bitlist"
+keywords = ["bitfields", "bitset", "bitvec", "int", "bigint"]
+license = "MIT"
+categories = ["data-structures", "mathematics", "algorithms"]
+homepage = "https://github.com/Kazik24/bitlist"
+repository = "https://github.com/Kazik24/bitlist"
+
+[dependencies]
+#smallvec = { version = "1.10.0", features = ["union", "const_new"]}
+#either = "1.8.1"
+
+[dev-dependencies]
+rand = "0.10"
+#wasm-bindgen-test = "0.3.37"
+
+[features]
+align_32 = [] # forces alignment of BitList and it's representations to be 32 bits (instead of 64 on 64-bit platforms)
+align_16 = [] # forces alignment of BitList and it's representations to be 16 bits (instead of 64 on 64-bit platforms)
