@@ -1,5 +1,6 @@
 #![allow(unsafe_code)]
 #![allow(unused)]
+#![doc = include_str!("../README.md")]
 
 mod basic_math;
 mod bitlist;

@@ -385,7 +385,7 @@ impl<'a> BitsIter<'a> {
         None
     }
 
-    /// align data in this iter to word boundary
+    /// TODO align data in this iter to word boundary
     pub fn word_aligned(&self) -> (WordBits, &'a [usize]) {
         let word = self.peek_word();
         let new_start = self.start + word.len();
