@@ -484,6 +484,10 @@ pub(crate) const fn word_index(bit_index: usize) -> usize {
     bit_index.wrapping_shr(SHIFT)
 }
 #[inline]
+pub(crate) const fn word_index_inclusive(bit_index: usize) -> usize {
+    word_index(bit_index) + if bit_in_word_index(bit_index) != 0 { 1 } else { 0 }
+}
+#[inline]
 pub(crate) const fn bit_in_word_index(bit_index: usize) -> usize {
     bit_index & (HeapBitList::WORD_SIZE - 1)
 }

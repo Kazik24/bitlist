@@ -1,6 +1,7 @@
-use crate::heap::{HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, word_index};
+use crate::heap::{HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, word_index, word_index_inclusive};
 use crate::wrapper::{ReprByRef, ReprRef};
 use crate::{BitList, InlineBitList};
+use std::alloc::Layout;
 use std::fmt::{Debug, Formatter};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
@@ -8,6 +9,7 @@ use std::mem::transmute;
 use std::num::NonZeroUsize;
 use std::ops::{Bound, Range, RangeBounds};
 use std::ptr::NonNull;
+use std::slice::from_raw_parts;
 
 impl BitList {
     pub const fn iter(&self) -> BitsIter<'_> {
@@ -104,6 +106,7 @@ unsafe impl Send for BitsIter<'_> {}
 unsafe impl Sync for BitsIter<'_> {}
 
 impl<'a> BitsIter<'a> {
+    #[inline]
     pub const fn empty() -> Self {
         Self { list_ptr: NonNull::dangling(), start: 0, stop: 0, _phantom: PhantomData }
     }
@@ -112,12 +115,15 @@ impl<'a> BitsIter<'a> {
         /// this keeps just a shared refs, so multiple instances with same pointer can exist
         Self { list_ptr: self.list_ptr, start: self.start, stop: self.stop, _phantom: PhantomData }
     }
+    #[inline]
     pub const fn len(&self) -> usize {
         self.stop - self.start
     }
+    #[inline]
     pub const fn is_empty(&self) -> bool {
         self.start == self.stop
     }
+    #[inline]
     pub fn from_inline<R: RangeBounds<usize>>(inline: &'a InlineBitList, range: R) -> Self {
         Self::from_inline_bounds(inline, range.start_bound(), range.end_bound())
     }
@@ -138,6 +144,7 @@ impl<'a> BitsIter<'a> {
             _phantom: PhantomData,
         }
     }
+    #[inline]
     pub(crate) fn from_heap<R: RangeBounds<usize>>(heap: &'a HeapBitList, range: R) -> Self {
         Self::from_heap_bounds(heap, range.start_bound(), range.end_bound())
     }
@@ -158,8 +165,24 @@ impl<'a> BitsIter<'a> {
             _phantom: PhantomData,
         }
     }
+    #[inline]
     pub fn from_words<R: RangeBounds<usize>>(words: &'a [usize], range: R) -> Self {
         Self::from_words_bounds(words, range.start_bound(), range.end_bound())
+    }
+    #[inline]
+    pub const fn from_full_words(words: &'a [usize]) -> Self {
+        let len =
+            words.len().checked_mul(HeapBitList::WORD_SIZE as _).expect("Too large array, cannot bit-index with usize");
+        Self {
+            list_ptr: unsafe { NonNull::new_unchecked(words.as_ptr().cast_mut()) },
+            start: 0,
+            stop: len,
+            _phantom: PhantomData,
+        }
+    }
+    #[inline]
+    pub const fn from_array_words<const N: usize>(words: &'a [usize; N]) -> Self {
+        Self::from_full_words(words)
     }
     const fn zero_pointer_offset(&mut self) {
         let start_offset = word_index(self.start);
@@ -233,15 +256,34 @@ impl<'a> BitsIter<'a> {
             self.start = floor
         }
     }
-    pub fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
-        if let Some(new_start) = self.start.checked_add(n).filter(|s| *s <= self.stop) {
-            self.start = new_start;
-            Ok(())
-        } else {
-            let len = self.len();
-            self.start = self.stop;
-            debug_assert_ne!(len, 0);
-            Err(unsafe { NonZeroUsize::new_unchecked(len) })
+    pub const fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+        match self.start.checked_add(n) {
+            Some(new_start) if new_start <= self.stop => {
+                self.start = new_start;
+                Ok(())
+            }
+            None | Some(_) => {
+                let len = (&*self).len();
+                self.start = self.stop;
+                let advanced = n - len;
+                debug_assert!(advanced > 0);
+                Err(unsafe { NonZeroUsize::new_unchecked(advanced) })
+            }
+        }
+    }
+    pub const fn advance_back_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
+        match self.stop.checked_sub(n) {
+            Some(new_stop) if new_stop >= self.start => {
+                self.stop = new_stop;
+                Ok(())
+            }
+            None | Some(_) => {
+                let len = (&*self).len();
+                self.stop = self.start;
+                let advanced = n - len;
+                debug_assert!(advanced > 0);
+                Err(unsafe { NonZeroUsize::new_unchecked(advanced) })
+            }
         }
     }
 
@@ -270,12 +312,31 @@ impl<'a> BitsIter<'a> {
         if len == 0 {
             return WordBits::empty();
         }
-        let word = self.read_word_at_bit_index(self.stop - 1);
         let idx = bit_in_word_index(self.stop);
+        let mut word = self.read_word_at_bit_index(if idx == 0 { self.stop - 1 } else { self.stop });
         println!("idx: {}", idx); //todo
         let rest = HeapBitList::WORD_SIZE - idx;
         let min = if rest < len { rest } else { len };
         WordBits::new(word, min as _)
+    }
+
+    pub const fn full_words(&self) -> &'a [usize] {
+        let start = word_index_inclusive(self.start);
+        let stop = word_index(self.stop);
+        let len = match stop.checked_sub(start) {
+            Some(v) => v,
+            None => 0,
+        };
+        unsafe { from_raw_parts(self.list_ptr.add(start).as_ptr(), len) }
+    }
+
+    pub const fn memory_slice(&self) -> (u16, &'a [usize]) {
+        let start = word_index(self.start);
+        let stop = word_index_inclusive(self.stop);
+        debug_assert!(stop >= start);
+        let len = stop - start; // unchecked as this can never overflow
+        let arr = unsafe { from_raw_parts(self.list_ptr.add(start).as_ptr(), len) };
+        (bit_in_word_index(self.start) as u16, arr)
     }
 
     /// Moves this iterator to next set bit or clear bit in sequence, and consumes this bit, returning offset from
@@ -311,6 +372,7 @@ impl<'a> BitsIter<'a> {
                     count += index as usize;
                     self.start += (index + 1) as usize;
                     if self.start > self.stop {
+                        self.start = self.stop;
                         return None;
                     }
                     return Some(count);
@@ -329,6 +391,7 @@ impl<'a> BitsIter<'a> {
                     count += index as usize;
                     self.start += (index + 1) as usize;
                     if self.start > self.stop {
+                        self.start = self.stop;
                         return None;
                     }
                     return Some(count);
@@ -352,32 +415,127 @@ impl<'a> BitsIter<'a> {
         None
     }
 
-    /// Find next continuous slot of bits all of same value, return offset of this slot from start
+    pub const fn const_next(&mut self) -> Option<bool> {
+        if self.start == self.stop {
+            None
+        } else {
+            let word = self.read_word_at_bit_index(self.start);
+            let mask = 1 << bit_in_word_index(self.start);
+            self.start += 1;
+            Some(word & mask != 0)
+        }
+    }
+    pub const fn const_next_back(&mut self) -> Option<bool> {
+        if self.start == self.stop {
+            None
+        } else {
+            let new_stop = self.stop - 1;
+            let word = self.read_word_at_bit_index(new_stop);
+            let mask = 1 << bit_in_word_index(new_stop);
+            self.stop = new_stop;
+            Some(word & mask != 0)
+        }
+    }
+    pub const fn const_nth(&mut self, n: usize) -> Option<bool> {
+        match self.start.checked_add(n) {
+            Some(new_start) if new_start <= self.stop => self.start = new_start,
+            None | Some(_) => self.start = self.stop,
+        }
+        self.const_next()
+    }
+    pub const fn const_nth_back(&mut self, n: usize) -> Option<bool> {
+        match self.stop.checked_sub(n) {
+            Some(new_stop) if new_stop > self.start => self.stop = new_stop,
+            None | Some(_) => self.stop = self.start,
+        }
+        self.const_next_back()
+    }
+
+    /// Find next continuous slot of 'size' bits all of same value, return offset of this slot from start
     /// and advances this iterator to the end of that slot.
-    pub const fn find_continuous_slot(&mut self, value: bool, length: usize) -> Option<usize> {
-        if length == 0 {
+    /// This function can be used e.g in memory allocators to find next free slot.
+    pub const fn find_continuous_slot(&mut self, value: bool, size: usize) -> Option<usize> {
+        if size == 0 {
             return Some(0); // empty slot is always available without advancing iterator
         }
-        let length = length - 1; // bit_position always consumes at least one bit
+        let size = size - 1; // bit_position always consumes at least one bit
 
         let mut index = 0;
         while let Some(offset) = self.bit_position(value) {
             index += offset;
-            // println!("index: {index}, offset: {offset}");
             // with_limit to not check too far, e.g if there are few MB of same bits
-            if let Some(end_off) = self.copy().with_limit(length).bit_position(!value) {
+            if let Some(end_off) = self.copy().with_limit(size).bit_position(!value) {
                 // println!("end_off: {end_off}");
-                if end_off >= length {
-                    self.start += length; //here always valid to self.advance_by(length);
+                if end_off >= size {
+                    self.start += size; //here always valid to self.advance_by(size);
                     debug_assert!(self.start <= self.stop);
                     return Some(index);
                 }
                 index += end_off + 1;
                 self.start += end_off; //here always valid to self.advance_by(end_off);
                 debug_assert!(self.start <= self.stop);
-            } else if (&*self).len() >= length {
-                // no more opposite bits, but length bits availables
-                self.start += length; //here always valid to self.advance_by(length);
+            } else if (&*self).len() >= size {
+                // no more opposite bits, but size bits availables
+                self.start += size; //here always valid to self.advance_by(size);
+                debug_assert!(self.start <= self.stop);
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Same as `find_continuous_slot` but the slot will be aligned to `layout.align()` bits from current position of this iterator.
+    /// This function can be used e.g in memory allocators to find next properly aligned free slot.
+    /// The provided Layout is interpreted as bit size and align pair.
+    #[inline]
+    pub const fn find_continuous_slot_layout(&mut self, value: bool, layout: Layout) -> Option<usize> {
+        self.find_continuous_slot_align(value, layout.size(), layout.align())
+    }
+
+    /// Same as `find_continuous_slot` but the slot will be aligned to `align` bits from current position of this iterator.
+    /// This function can be used e.g in memory allocators to find next properly aligned free slot.
+    ///  Will panic if align is not power of two or zero
+    pub const fn find_continuous_slot_align(&mut self, value: bool, size: usize, align: usize) -> Option<usize> {
+        if !align.is_power_of_two() {
+            panic!("align must be power of two and non-zero");
+        }
+        if size == 0 {
+            return Some(0); // empty slot is always available without advancing iterator and properly aligned
+        }
+        let align_mask = align - 1;
+        let size = size - 1; // bit_position always consumes at least one bit
+
+        let mut index = 0;
+        while let Some(offset) = self.bit_position(value) {
+            index += offset;
+            // align index
+            if index & align_mask != 0 {
+                let fill_offset = align - (index & align_mask);
+                self.start += fill_offset - 1;
+                if self.start >= self.stop {
+                    self.start = self.stop;
+                    return None;
+                }
+                index += fill_offset;
+                match self.const_next() {
+                    Some(val) if val == value => {} // check if index still points to correct bit value
+                    _ => continue,
+                }
+            }
+            // with_limit to not check too far, e.g if there are few MB of same bits
+            if let Some(end_off) = self.copy().with_limit(size).bit_position(!value) {
+                // println!("end_off: {end_off}");
+                if end_off >= size {
+                    self.start += size; //here always valid to self.advance_by(size);
+                    debug_assert!(self.start <= self.stop);
+                    return Some(index);
+                }
+                index += end_off + 1;
+                self.start += end_off; //here always valid to self.advance_by(end_off);
+                debug_assert!(self.start <= self.stop);
+            } else if (&*self).len() >= size {
+                // no more opposite bits, but size bits availables
+                self.start += size; //here always valid to self.advance_by(size);
                 debug_assert!(self.start <= self.stop);
                 return Some(index);
             }
@@ -386,20 +544,20 @@ impl<'a> BitsIter<'a> {
     }
 
     /// TODO align data in this iter to word boundary
-    pub fn word_aligned(&self) -> (WordBits, &'a [usize]) {
-        let word = self.peek_word();
-        let new_start = self.start + word.len();
-        debug_assert!(new_start <= self.stop);
-        // check if word aligned (only applicable if it's not the last word)
-        if cfg!(debug_assertions) && new_start != self.stop {
-            debug_assert!(new_start % HeapBitList::WORD_SIZE == 0);
-        }
-
-        todo!()
+    pub const fn word_aligned(&self) -> (WordBits, &'a [usize]) {
+        let (bit_index, mem) = self.memory_slice();
+        let Some((&word, rest_mem)) = mem.split_first() else {
+            return (WordBits::empty(), mem);
+        };
+        let len = self.len();
+        let rest = WordBits::BITS - bit_index;
+        let min = if len > rest as _ { rest } else { len as _ };
+        let word = WordBits::new(word >> bit_index, min as u32);
+        (word, rest_mem)
     }
 
     /// if all bits are the same then return that value, if there are multiple bit values or iterator is empty, return None.
-    pub fn all_value(mut self) -> Option<bool> {
+    pub const fn all_value(mut self) -> Option<bool> {
         if self.is_empty() {
             return None;
         }
@@ -417,14 +575,7 @@ impl<'a> BitsIter<'a> {
 impl Iterator for BitsIter<'_> {
     type Item = bool;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.start == self.stop {
-            None
-        } else {
-            let word = self.read_word_at_bit_index(self.start);
-            let mask = 1 << bit_in_word_index(self.start);
-            self.start += 1;
-            Some(word & mask != 0)
-        }
+        self.const_next()
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = self.len();
@@ -437,33 +588,23 @@ impl Iterator for BitsIter<'_> {
         self.len()
     }
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        if let Some(new_start) = self.start.checked_add(n).filter(|s| *s <= self.stop) {
-            self.start = new_start;
-        } else {
-            self.start = self.stop;
-        }
-        self.next()
+        self.const_nth(n)
+    }
+    fn last(mut self) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        self.next_back()
     }
 }
 impl DoubleEndedIterator for BitsIter<'_> {
+    // TODO Why Rev<Iter> has no implementation for Iterator::last, as it can just forward to .next() ??? is this rust-lang std problem?
+    // Currently Iterator::last is implemented by default as using fold, so it goes through whole iterator in reverse.
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.start == self.stop {
-            None
-        } else {
-            let new_stop = self.stop - 1;
-            let word = self.read_word_at_bit_index(new_stop);
-            let mask = 1 << bit_in_word_index(new_stop);
-            self.stop = new_stop;
-            Some(word & mask != 0)
-        }
+        self.const_next_back()
     }
     fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        if let Some(new_stop) = self.stop.checked_sub(n).filter(|s| *s > self.start) {
-            self.stop = new_stop;
-        } else {
-            self.stop = self.start;
-        }
-        self.next_back()
+        self.const_nth_back(n)
     }
 }
 impl ExactSizeIterator for BitsIter<'_> {
@@ -876,6 +1017,42 @@ mod tests {
         let mut iter = BitsIter::from_words(&[0b00000000_00000000], 0..4);
         assert_eq!(iter.find_continuous_slot(false, 4), Some(0));
         assert_eq!(iter.len(), 0);
+    }
+
+    #[test]
+    fn test_find_continuous_slot_aligned() {
+        // cases: (word, size, align, expected, expected_pos)
+        let cases = [
+            (0b00000000_00000000, 4, 4, Some(0), 4),
+            (0b00000000_00000000, 4, 2, Some(0), 4),
+            (0b00000000_00000000, 4, 1, Some(0), 4),
+            (0b00000000_00000011, 4, 4, Some(4), 8),
+            (0b00000000_00000011, 4, 2, Some(2), 6),
+            (0b00000000_00000011, 4, 1, Some(2), 6),
+            (0b00000001_10000111, 4, 4, Some(12), 16),
+            (0b00000001_10000111, 4, 2, Some(10), 14),
+            (0b00000001_10000111, 4, 1, Some(3), 7),
+            (0b01000001_10001001, 4, 4, Some(16), 20),
+            (0b01000001_10001001, 4, 2, Some(10), 14),
+            (0b01000001_10001001, 4, 1, Some(9), 13),
+        ];
+
+        let mut i = 0;
+        for (word, size, align, expected, expected_pos) in cases {
+            let w = &[word];
+            let mut iter = BitsIter::from_words(w, 0..64);
+            assert_eq!(
+                iter.find_continuous_slot_align(false, size, align),
+                expected,
+                "{i} word: {word:016b}, size: {size}, align: {align}, expected: {expected:?}, expected_pos: {expected_pos}"
+            );
+            let size = 64 - iter.len();
+            assert_eq!(
+                size, expected_pos,
+                "{i} word: {word:016b}, size: {size}, align: {align}, expected: {expected:?}, expected_pos: {expected_pos}"
+            );
+            i += 1;
+        }
     }
 
     #[test]
