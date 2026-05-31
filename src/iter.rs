@@ -1,11 +1,12 @@
-use crate::heap::{HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, word_index, word_index_inclusive};
+use crate::heap::{HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, word_index, words_for};
+use crate::util::copy_bits_nonoverlapping;
 use crate::wrapper::{ReprByRef, ReprRef};
 use crate::{BitList, InlineBitList};
 use std::alloc::Layout;
 use std::fmt::{Debug, Formatter};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
-use std::mem::transmute;
+use std::mem::{MaybeUninit, transmute};
 use std::num::NonZeroUsize;
 use std::ops::{Bound, Range, RangeBounds};
 use std::ptr::NonNull;
@@ -127,6 +128,19 @@ impl<'a> BitsIter<'a> {
     pub fn from_inline<R: RangeBounds<usize>>(inline: &'a InlineBitList, range: R) -> Self {
         Self::from_inline_bounds(inline, range.start_bound(), range.end_bound())
     }
+    pub const unsafe fn new_unchecked(list_ptr: *const usize, start: usize, length: usize) -> Self {
+        debug_assert!(start.checked_add(length).is_some());
+        unsafe { Self::new_unchecked_range(list_ptr, start..start + length) }
+    }
+    pub const unsafe fn new_unchecked_range(list_ptr: *const usize, range: Range<usize>) -> Self {
+        debug_assert!(range.start <= range.end);
+        Self {
+            list_ptr: unsafe { NonNull::new_unchecked(list_ptr.cast_mut()) },
+            start: range.start,
+            stop: range.end,
+            _phantom: PhantomData,
+        }
+    }
     pub const fn from_inline_bounds(
         inline: &'a InlineBitList,
         start_bound: Bound<&usize>,
@@ -206,20 +220,20 @@ impl<'a> BitsIter<'a> {
         }
     }
 
-    /// works as `.take(limit)` on iterator but doesn't change type and takes mutable reference, trurns true if limit was applied
+    /// works as `.take(limit)` on iterator but doesn't change type and takes mutable reference, trurns true if limit was in bounds
     pub const fn set_limit(&mut self, limit: usize) -> bool {
         let len = (&*self).len();
-        if limit >= len {
-            return false; // no limit set, limit is bigger that size of this iterator
+        if limit > len {
+            return false; //limit is bigger that size of this iterator
         }
         debug_assert!(self.stop >= self.start + limit);
         self.stop = self.start + limit;
         true
     }
-    /// Move start to be 'limit' bits from end, returns true if limit was applied, false if it is bigger than length
+    /// Move start to be 'limit' bits from end, returns true if limit was in bounds, false if limit was outside
     pub const fn set_end_limit(&mut self, limit: usize) -> bool {
         let len = (&*self).len();
-        if limit >= len {
+        if limit > len {
             return false; // no limit set, limit is bigger that size of this iterator
         }
         debug_assert!(self.start <= self.stop - limit);
@@ -287,11 +301,26 @@ impl<'a> BitsIter<'a> {
         }
     }
 
+    pub const fn to_inline_list(mut self) -> Option<InlineBitList> {
+        if self.len() > InlineBitList::MAX_INLINE_BITS as _ {
+            return None;
+        }
+        let mut words = self.next_word();
+        words.push_bits(self.next_word());
+        words.try_inline()
+    }
+
+    pub fn to_list(self) -> BitList {
+        BitList::from_bits(self)
+    }
+
+    #[inline]
     const fn read_word_at_bit_index(&self, index: usize) -> usize {
         debug_assert!(index >= self.start);
         debug_assert!(index < self.stop);
         unsafe { self.read_word_unchecked(word_index(index)) }
     }
+    #[inline]
     const unsafe fn read_word_unchecked(&self, index: usize) -> usize {
         unsafe { self.list_ptr.add(index).read() }
     }
@@ -305,7 +334,38 @@ impl<'a> BitsIter<'a> {
         let idx = bit_in_word_index(self.start);
         let rest = HeapBitList::WORD_SIZE - idx;
         let min = if rest < len { rest } else { len };
-        WordBits::new(word >> idx, min as _)
+        WordBits::new_unchecked(word >> idx, min as _)
+    }
+    #[inline]
+    pub const fn next_word(&mut self) -> WordBits {
+        let len = (&*self).len();
+        if len == 0 {
+            return WordBits::empty();
+        }
+        let word = self.read_word_at_bit_index(self.start);
+        let idx = bit_in_word_index(self.start);
+        let rest = HeapBitList::WORD_SIZE - idx;
+        let min = if rest < len { rest } else { len };
+        self.start += min;
+        debug_assert!(self.start <= self.stop);
+        WordBits::new_unchecked(word >> idx, min as _)
+    }
+    #[inline]
+    pub const fn next_unaligned_word(&mut self) -> WordBits {
+        self.next_bits(WordBits::BITS as _)
+    }
+    /// Returns the next n bits that fint in a single word, n can be bigger than length of iterator or WordBits::BITS
+    /// but only at most WordBits::BITS will be returned
+    #[inline]
+    pub const fn next_bits(&mut self, n: usize) -> WordBits {
+        let mut it = self.copy().with_limit(n);
+        let mut w = it.next_word();
+        if w.len() < n {
+            w.push_bits(it.next_word());
+        }
+        w.truncate(n);
+        self.start += w.len();
+        w
     }
     pub fn rpeek_word(&self) -> WordBits {
         let len = self.len();
@@ -321,7 +381,7 @@ impl<'a> BitsIter<'a> {
     }
 
     pub const fn full_words(&self) -> &'a [usize] {
-        let start = word_index_inclusive(self.start);
+        let start = words_for(self.start);
         let stop = word_index(self.stop);
         let len = match stop.checked_sub(start) {
             Some(v) => v,
@@ -332,7 +392,7 @@ impl<'a> BitsIter<'a> {
 
     pub const fn memory_slice(&self) -> (u16, &'a [usize]) {
         let start = word_index(self.start);
-        let stop = word_index_inclusive(self.stop);
+        let stop = words_for(self.stop);
         debug_assert!(stop >= start);
         let len = stop - start; // unchecked as this can never overflow
         let arr = unsafe { from_raw_parts(self.list_ptr.add(start).as_ptr(), len) };
@@ -415,6 +475,7 @@ impl<'a> BitsIter<'a> {
         None
     }
 
+    #[inline]
     pub const fn const_next(&mut self) -> Option<bool> {
         if self.start == self.stop {
             None
@@ -425,6 +486,11 @@ impl<'a> BitsIter<'a> {
             Some(word & mask != 0)
         }
     }
+    #[inline]
+    pub const fn peek_next(&self) -> Option<bool> {
+        self.copy().const_next()
+    }
+    #[inline]
     pub const fn const_next_back(&mut self) -> Option<bool> {
         if self.start == self.stop {
             None
@@ -436,6 +502,11 @@ impl<'a> BitsIter<'a> {
             Some(word & mask != 0)
         }
     }
+    #[inline]
+    pub const fn peek_next_back(&self) -> Option<bool> {
+        self.copy().const_next_back()
+    }
+    #[inline]
     pub const fn const_nth(&mut self, n: usize) -> Option<bool> {
         match self.start.checked_add(n) {
             Some(new_start) if new_start <= self.stop => self.start = new_start,
@@ -443,6 +514,7 @@ impl<'a> BitsIter<'a> {
         }
         self.const_next()
     }
+    #[inline]
     pub const fn const_nth_back(&mut self, n: usize) -> Option<bool> {
         match self.stop.checked_sub(n) {
             Some(new_stop) if new_stop > self.start => self.stop = new_stop,
@@ -453,7 +525,7 @@ impl<'a> BitsIter<'a> {
 
     /// Find next continuous slot of 'size' bits all of same value, return offset of this slot from start
     /// and advances this iterator to the end of that slot.
-    /// This function can be used e.g in memory allocators to find next free slot.
+    /// This function can be used e.g in memory allocators to find next free slot, equivalent to [`Self::find_continuous_slot_align`] with align=1
     pub const fn find_continuous_slot(&mut self, value: bool, size: usize) -> Option<usize> {
         if size == 0 {
             return Some(0); // empty slot is always available without advancing iterator
@@ -570,6 +642,35 @@ impl<'a> BitsIter<'a> {
             None => Some(false),
         }
     }
+
+    /// Copies all bits from this iterator to dst pointer, with bit offset of 'dst_bit_offset' into that pointer
+    /// ## Safety:
+    /// Caller must ensure that:
+    /// - dst pointer is valid for writes of at least `self.len()` bits, where start is rounded to previous word boundary
+    ///   and end are rounded to next word boundary.
+    /// - if `dst_bit_offset` is not aligned to word boundary, caller must ensure that first word in `dst` with bit
+    ///   offset of `dst_bit_offset` is initialized
+    /// - if `dst_bit_offset + self.len()` is not aligned to word boundary, caller must ensure that last word in `dst`
+    ///   with bit offset of `dst_bit_offset + self.len()` is initialized
+    ///
+    pub const unsafe fn copy_bits_nonoverlapping(&self, dst: *mut usize, dst_bit_offset: usize) {
+        unsafe {
+            copy_bits_nonoverlapping(self.list_ptr.as_ptr().cast_const(), self.start, dst, dst_bit_offset, self.len());
+        }
+    }
+    /// Safe version of `copy_bits_nonoverlapping`, will panic if iterator length is outside destination region
+    pub const fn copy_bits_slice(&self, dst: &mut [usize], dst_bit_offset: usize) {
+        match self.len().checked_add(dst_bit_offset) {
+            Some(len) if words_for(len) > dst.len() => panic!("iterator too long to fit in dst slice"),
+            None => panic!("iterator length and dst_bit_offset overflow"),
+            Some(_) => {}
+        }
+        /// SAFETY: we checked lengths of dst region, dst is &mut so we know it's unique and all elements, especially first and last
+        /// word are initialized
+        unsafe {
+            self.copy_bits_nonoverlapping(dst.as_mut_ptr(), dst_bit_offset);
+        }
+    }
 }
 
 impl Iterator for BitsIter<'_> {
@@ -614,8 +715,10 @@ impl ExactSizeIterator for BitsIter<'_> {
 }
 impl FusedIterator for BitsIter<'_> {}
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Eq, Hash)]
 pub struct WordBits {
+    /// only first `count` bits are valid, other bits are undefined and can be have any value, so before
+    /// returing this word please sanitize it by masking bits outside `count`
     value: usize,
     count: u16,
 }
@@ -623,28 +726,39 @@ pub struct WordBits {
 impl WordBits {
     pub const BITS: u16 = usize::BITS as _;
 
+    #[inline]
     pub const fn empty() -> Self {
         Self::new_unchecked(0, 0)
     }
+    #[inline]
     pub const fn new(value: usize, count: u32) -> Self {
-        assert!(count <= (usize::BITS as _), "Word cannot have that many bits");
-        Self { value: value & last_word_mask(count as _), count: count as _ }
+        let count = if count > Self::BITS as _ { Self::BITS } else { count as _ };
+        Self { value: value & last_word_mask(count as _), count }
     }
+    #[inline]
     pub(crate) const fn new_unchecked(value: usize, count: u16) -> Self {
         debug_assert!(count <= (usize::BITS as _));
         Self { value, count }
     }
+    #[inline]
     pub const fn new_full(value: usize) -> Self {
         Self::new_unchecked(value, usize::BITS as _)
     }
+    #[inline]
     pub const fn raw(&self) -> usize {
-        self.value
+        self.value & last_word_mask(self.count as _)
     }
+    #[inline]
     pub const fn len(&self) -> usize {
         self.count as _
     }
+    #[inline]
     pub const fn is_empty(&self) -> bool {
         self.count == 0
+    }
+    #[inline]
+    pub const fn is_full(&self) -> bool {
+        self.count == Self::BITS
     }
     pub const fn first_set_bit(self) -> Option<u16> {
         let idx = self.value.trailing_zeros() as u16;
@@ -656,6 +770,65 @@ impl WordBits {
     }
     pub const fn first_bit_value(self, value: bool) -> Option<u16> {
         if value { self.first_set_bit() } else { self.first_clr_bit() }
+    }
+    #[inline]
+    pub const fn truncate(&mut self, count: usize) {
+        let max_count = if count > Self::BITS as _ { Self::BITS } else { count as u16 };
+        self.count = if self.count > max_count { max_count } else { self.count };
+    }
+    #[inline]
+    pub const fn truncated(mut self, count: usize) -> Self {
+        self.truncate(count);
+        self
+    }
+    pub const fn push(&mut self, value: bool) -> bool {
+        if self.count < Self::BITS {
+            let sanitize_mask = (1 << self.count);
+            self.value = (self.value & !sanitize_mask) | (value as usize).wrapping_shl(self.count as _);
+            self.count += 1;
+            true
+        } else {
+            false
+        }
+    }
+    pub const fn push_bits(&mut self, bits: WordBits) -> bool {
+        if self.count + bits.count <= Self::BITS {
+            self.value = (self.value & last_word_mask(self.count as _)) | bits.value.wrapping_shl(self.count as _);
+            self.count += bits.count;
+            true
+        } else {
+            false
+        }
+    }
+    pub const fn push_overflowing(&mut self, bits: WordBits) -> WordBits {
+        let new_len = self.count + bits.count;
+        self.value = (self.value & last_word_mask(self.count as _)) | bits.value.wrapping_shl(self.count as _);
+        if new_len <= Self::BITS {
+            self.count = new_len;
+            WordBits::empty()
+        } else {
+            let w = WordBits::new_unchecked(bits.value >> (Self::BITS - self.count), new_len - Self::BITS);
+            self.count = Self::BITS;
+            w
+        }
+    }
+    pub const fn pop_front(&mut self, count: u16) -> WordBits {
+        match self.count.checked_sub(count) {
+            Some(new_count) => {
+                let front = WordBits::new_unchecked(self.value, count);
+                self.value = self.value >> count;
+                self.count = new_count;
+                front
+            }
+            None => std::mem::replace(self, WordBits::empty()),
+        }
+    }
+
+    pub const fn try_inline(self) -> Option<InlineBitList> {
+        if self.count <= InlineBitList::MAX_INLINE_BITS as _ {
+            return Some(InlineBitList::new_masked(self.value, self.count as _));
+        }
+        None
     }
     // pub const fn last_set_bit(self) -> Option<u16> {
     //     let padding = Self::BITS - self.count;
@@ -671,6 +844,12 @@ impl WordBits {
     // pub const fn last_bit_value(self, value: bool) -> Option<u16> {
     //     if value { self.last_set_bit() } else { self.last_clr_bit() }
     // }
+}
+impl PartialEq for WordBits {
+    fn eq(&self, other: &Self) -> bool {
+        let xor = self.value ^ other.value;
+        self.count == other.count && xor & last_word_mask(self.count as _) == 0
+    }
 }
 
 impl Debug for WordBits {
@@ -1074,5 +1253,15 @@ mod tests {
             let vals = BitList::from_trunc_u128(rng.random(), rng.random_range(0..128));
             assert_eq!(vals.iter().rposition(|v| v), vals.iter().rbit_position(true), "{vals:?}");
         }
+    }
+
+    #[test]
+    fn test_next_word() {
+        let mut iter = BitsIter::from_words(&[0x0000_1000_1001_0000, 0x0000_0000_0000_0101], 8..74);
+        assert_eq!(iter.copy().with_limit(32).next_unaligned_word(), WordBits::new(0x0000_0000_0010_0100, 32));
+        assert_eq!(iter.copy().with_limit(32).len(), 32);
+        assert_eq!(iter.copy().next_unaligned_word(), WordBits::new(0x0100_0010_0010_0100, 64));
+        assert_eq!(iter.next_word(), WordBits::new(0x0000_0010_0010_0100, 56));
+        assert_eq!(iter.next_word(), WordBits::new(0x0000_0000_0000_0101, 10));
     }
 }

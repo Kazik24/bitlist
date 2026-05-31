@@ -466,13 +466,14 @@ impl Drop for HeapBitList {
     }
 }
 
+/// word_index_inclusive
 #[inline]
 pub(crate) const fn words_for(bits: usize) -> usize {
-    bits / HeapBitList::WORD_SIZE + if bits % HeapBitList::WORD_SIZE != 0 { 1 } else { 0 }
+    word_index(bits) + if bit_in_word_index(bits) != 0 { 1 } else { 0 }
 }
 #[inline]
 pub(crate) const fn last_word_mask(len: usize) -> usize {
-    let shift = len & (HeapBitList::WORD_SIZE - 1);
+    let shift = bit_in_word_index(len);
     if shift == 0 && len != 0 {
         return usize::MAX;
     }
@@ -482,10 +483,6 @@ pub(crate) const fn last_word_mask(len: usize) -> usize {
 pub(crate) const fn word_index(bit_index: usize) -> usize {
     const SHIFT: u32 = (HeapBitList::WORD_SIZE - 1).count_ones();
     bit_index.wrapping_shr(SHIFT)
-}
-#[inline]
-pub(crate) const fn word_index_inclusive(bit_index: usize) -> usize {
-    word_index(bit_index) + if bit_in_word_index(bit_index) != 0 { 1 } else { 0 }
 }
 #[inline]
 pub(crate) const fn bit_in_word_index(bit_index: usize) -> usize {
@@ -528,5 +525,26 @@ mod tests {
             //println!("{i:>3} {mask:064b}");
             assert_eq!(mask.count_ones(), expect);
         }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_bit_word_index() {
+        assert_eq!(bit_in_word_index(0), 0);
+        assert_eq!(bit_in_word_index(63), 63);
+        assert_eq!(bit_in_word_index(64), 0);
+        assert_eq!(word_index(0), 0);
+        assert_eq!(word_index(63), 0);
+        assert_eq!(word_index(64), 1);
+        assert_eq!(words_for(0), 0);
+        assert_eq!(words_for(1), 1);
+        assert_eq!(words_for(63), 1);
+        assert_eq!(words_for(64), 1);
+        assert_eq!(words_for(65), 2);
+        assert_eq!(last_word_mask(0), 0);
+        assert_eq!(last_word_mask(1), 1);
+        assert_eq!(last_word_mask(63), 0x7fff_ffff_ffff_ffff);
+        assert_eq!(last_word_mask(64), usize::MAX);
+        assert_eq!(last_word_mask(65), 1);
     }
 }

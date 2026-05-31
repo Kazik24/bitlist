@@ -3,7 +3,7 @@ use crate::BitsIter;
 use crate::heap::{HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, word_index, words_for};
 use crate::inline::InlineBitList;
 use crate::iter::bounds_to_range;
-use crate::util::{for_each_carry, unary_for_each_carry};
+use crate::util::{copy_bits_nonoverlapping, for_each_carry, unary_for_each_carry};
 use crate::wrapper::{ReprByRef, ReprMut, ReprRef};
 use std::alloc::Layout;
 use std::cmp::Ordering;
