@@ -277,20 +277,21 @@ impl BitList {
         }
     }
 
-    pub fn set_range(&mut self, index: usize, value: &Self) -> Option<()> {
-        match self.inner_mut() {
-            ReprMut::Inline(v) => {
-                let Ok(val) = value.to_inline_type() else {
-                    return None;
-                };
-                v.set_at(index, val).then_some(())
-            }
-            ReprMut::Heap(v) => v.set_at(index, value).then_some(()),
+    pub const fn set_range(&mut self, index: usize, value: &Self) -> Option<()> {
+        let mut it = match self.try_range_iter_mut_from(index) {
+            Some(it) => it,
+            None => return None,
+        };
+        let value = value.iter();
+        if !it.set_limit(value.len()) {
+            return None;
         }
+        it.copy_from(value);
+        Some(())
     }
 
-    pub fn set_range_fill(&mut self, index: usize, length: usize, value: bool) -> Option<()> {
-        self.set_range(index, &BitList::values(length, value))
+    pub fn set_range_fill(&mut self, range: impl RangeBounds<usize>, value: bool) {
+        self.range_iter_mut(range).fill(value);
     }
 
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), AllocateError> {
@@ -1071,11 +1072,22 @@ impl FromStr for BitList {
 
 impl Binary for BitList {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut buffer = [0u8; 128];
+        let mut i = 0;
+
         for b in self.iter().rev() {
-            if b {
-                write!(f, "1")?;
-            } else {
-                write!(f, "0")?;
+            buffer[i] = if b { b'1' } else { b'0' };
+            i += 1;
+            if i == buffer.len() {
+                unsafe {
+                    f.write_str(std::str::from_utf8_unchecked(&buffer))?;
+                }
+                i = 0;
+            }
+        }
+        if i != 0 {
+            unsafe {
+                f.write_str(std::str::from_utf8_unchecked(&buffer[..i]))?;
             }
         }
         Ok(())
@@ -1360,6 +1372,20 @@ mod tests {
     }
 
     #[test]
+    fn test_write_binary() {
+        let rng = &mut StdRng::seed_from_u64(12341234);
+        let mut buff = String::with_capacity(1024);
+        for _ in 0..100000 {
+            buff.clear();
+            for _ in 0..rng.random_range(0..512) {
+                buff.push(if rng.random_bool(0.5) { '1' } else { '0' });
+            }
+            let fmt = format!("{:b}", BitList::lit(&buff));
+            assert_eq!(buff, fmt);
+        }
+    }
+
+    #[test]
     fn test_unsigned_cmp() {
         fn comp(a: i32, b: i32) -> Ordering {
             let a = a.to_be_bytes();
@@ -1440,6 +1466,32 @@ mod tests {
             let expected = format!("{number}");
             let got = bl.format_decimal().to_string();
             assert_eq!(expected, got);
+        }
+    }
+
+    #[test]
+    fn test_set_range() {
+        let rng = &mut StdRng::seed_from_u64(54342);
+        let mut bits = Vec::with_capacity(1024);
+        let mut to_set = Vec::with_capacity(1024);
+        for _ in 0..1000 {
+            bits.clear();
+            for _ in 0..rng.random_range(1..1024) {
+                bits.push(rng.random_bool(0.5));
+            }
+
+            let start = rng.random_range(0..bits.len());
+            let end = rng.random_range(start..bits.len());
+            to_set.clear();
+            for i in start..end {
+                to_set.push(rng.random_bool(0.5));
+            }
+
+            let mut main = BitList::from_bits(bits.iter().copied());
+            let mut set = BitList::from_bits(to_set.iter().copied());
+            main.set_range(start, &set);
+            bits[start..end].copy_from_slice(&to_set);
+            assert!(main.iter().eq(bits.iter().copied()));
         }
     }
 }

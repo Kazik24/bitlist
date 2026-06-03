@@ -1,4 +1,3 @@
-use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 use crate::{
@@ -59,6 +58,18 @@ fn for_each_carry_const<A, B: Copy, T, const N: usize>(
     carry
 }
 
+/// Copy non-overlapping bit ranges from `src` to `dst`
+/// # Safety
+/// Caller must ensure that:
+/// - src pointer is initialized and valid for reads of at least `self.len()` bits where start (`src_bit_offset`) is rounded to previous
+///   word boundary and end is rounded to next word boundary
+/// - dst pointer is valid for writes of at least `self.len()` bits, where start (`dst_bit_offset`) is rounded to previous word boundary
+///   and end is rounded to next word boundary.
+/// - src and dst are not overlapping regarding their bit ranges (they can overlap in words)
+/// - if `dst_bit_offset` is not aligned to word boundary, caller must ensure that first word in `dst` with bit
+///   offset of `dst_bit_offset` is initialized
+/// - if `dst_bit_offset + self.len()` is not aligned to word boundary, caller must ensure that last word in `dst`
+///   with bit offset of `dst_bit_offset + self.len()` is initialized
 pub const unsafe fn copy_bits_nonoverlapping(
     src: *const usize,
     src_bit_offset: usize,
@@ -153,6 +164,57 @@ pub const unsafe fn copy_bits_nonoverlapping(
     }
 }
 
+pub unsafe fn fill_bits(dst: *mut usize, dst_bit_offset: usize, bit_count: usize, value: bool) {
+    if bit_count == 0 {
+        return;
+    }
+    unsafe {
+        let dst = dst.cast::<u8>().add(byte_index(dst_bit_offset));
+        let dst_bit_offset = bit_in_byte_index(dst_bit_offset);
+        if dst_bit_offset == 0 {
+            // start of both regions is aligned to byte, use normal memcopy
+            let whole_bytes_len = byte_index(bit_count);
+            dst.write_bytes(if value { 0xff } else { 0 }, whole_bytes_len);
+            if bit_in_byte_index(bit_count) != 0 {
+                // last byte is not full
+                let mask = last_byte_mask(bit_count);
+                let dst_byte_ptr = dst.add(whole_bytes_len);
+                let last_byte_masked = dst_byte_ptr.read();
+                let new_byte = if value { last_byte_masked | mask } else { last_byte_masked & !mask };
+                dst_byte_ptr.write(new_byte);
+            }
+            return;
+        }
+        let first_byte = dst.read();
+        let mut end = dst_bit_offset + bit_count;
+        println!("first_byte: {first_byte:08b}, dst_bit_offset: {dst_bit_offset}, end: {end}");
+        if end < 8 {
+            let mask = !last_byte_mask(dst_bit_offset + 1) & last_byte_mask(end);
+            println!("mask: {:08b}", mask);
+            let new_byte = if value { first_byte | mask } else { first_byte & !mask };
+            dst.write(new_byte);
+            return;
+        } else {
+            let mask = last_byte_mask(dst_bit_offset + 1);
+            println!("mask rest: {:08b}", mask);
+            let new_byte = if value { first_byte | mask } else { first_byte & !mask };
+            dst.write(new_byte);
+        }
+        let dst = dst.add(1);
+        end -= (7 - dst_bit_offset);
+        let whole_bytes_len = byte_index(end);
+        dst.write_bytes(if value { 0xff } else { 0 }, whole_bytes_len);
+        println!("whole_bytes_len: {whole_bytes_len}, end: {end}");
+        if bit_in_byte_index(end) != 0 {
+            let mask = last_byte_mask(end);
+            println!("mask: {:08b}", mask);
+            let dst_byte_ptr = dst.add(whole_bytes_len);
+            let new_byte = if value { dst_byte_ptr.read() | mask } else { dst_byte_ptr.read() & !mask };
+            dst_byte_ptr.write(new_byte);
+        }
+    }
+}
+
 #[inline]
 const fn byte_index(bit_index: usize) -> usize {
     const SHIFT: u32 = (8u32 - 1).count_ones();
@@ -239,6 +301,75 @@ mod tests {
                 let soff = dst_ptr_bit_off + dst_off + bit_len;
                 let s2 = BitsIter::new_unchecked_range(dst.as_ptr(), soff..(MEM * WordBits::BITS as usize));
                 let d2 = BitsIter::new_unchecked_range(dst_snapshot.as_ptr(), soff..(MEM * WordBits::BITS as usize));
+                assert!(s1.eq(d1), "{i} s1 != d1");
+                assert!(s2.eq(d2), "{i} s2 != d2");
+            }
+            println!("Total time: {time:.03?}, total bits: {total_bits}, counter: {counter}");
+            let avg_bits = total_bits as f64 / counter as f64;
+            let words = avg_bits as f64 / 64.0;
+            let bytes = avg_bits as f64 / 8.0;
+            println!(
+                "Average time: {:.03?}, average bits: {avg_bits:.03} = {words:.03}W = {bytes:.03}B",
+                time / counter
+            );
+        }
+    }
+
+    #[test]
+    fn test_fill_bits_byte_aligned() {
+        const MEM: usize = 64;
+        let dst = &mut [0usize; MEM];
+        let dst_snapshot = &mut [0usize; MEM];
+
+        let rng = &mut StdRng::seed_from_u64(654321);
+
+        unsafe {
+            let mut time = Duration::ZERO;
+            let mut total_bits = 0;
+            let mut counter = 0;
+            for i in 0..1000 {
+                let dst_off = loop {
+                    let dst_off = rng.random_range(0..128);
+                    // filter only byte ranges
+                    //if bit_in_byte_index(src_off) == 0 && bit_in_byte_index(dst_off) == 0 {
+                    break dst_off;
+                    //}
+                };
+
+                let dst_ptr_off = rng.random_range(0..9);
+                let dst_ptr = dst.as_mut_ptr().add(dst_ptr_off);
+                let bit_len = rng.random_range(0..130);
+                rng.fill_bytes(dst.align_to_mut::<u8>().1);
+                dst_snapshot.copy_from_slice(dst);
+                let value = rng.random_bool(0.5);
+
+                // SAFETY: all generate values should be in bounds of src and dst memory regions
+
+                let start = Instant::now();
+                fill_bits(dst_ptr, dst_off, bit_len, value);
+                time += start.elapsed();
+                total_bits += bit_len;
+                counter += 1;
+
+                // check that regions are equal
+                let dst_region = BitsIter::new_unchecked(dst_ptr, dst_off, bit_len);
+                // println!("src: {:?}", src_region.copy().to_list());
+                println!("dst: {:?}", dst_region.copy().to_list());
+                let equal = dst_region.all_value() == Some(value);
+                assert!(
+                    equal,
+                    "{i} Bits are not equal - dst_ptr_off: {dst_ptr_off}, dst_off: {dst_off}, bit_len: {bit_len}"
+                );
+
+                // check that regions outside are unchanged
+                let dst_ptr_bit_off = dst_ptr_off * WordBits::BITS as usize;
+                let s1 = BitsIter::new_unchecked(dst.as_ptr(), 0, dst_ptr_bit_off + dst_off);
+                let d1 = BitsIter::new_unchecked(dst_snapshot.as_ptr(), 0, dst_ptr_bit_off + dst_off);
+                let soff = dst_ptr_bit_off + dst_off + bit_len;
+                let s2 = BitsIter::new_unchecked_range(dst.as_ptr(), soff..(MEM * WordBits::BITS as usize));
+                let d2 = BitsIter::new_unchecked_range(dst_snapshot.as_ptr(), soff..(MEM * WordBits::BITS as usize));
+                println!("s1: {:b}", s1.copy().to_list());
+                println!("d1: {:b}", d1.copy().to_list());
                 assert!(s1.eq(d1), "{i} s1 != d1");
                 assert!(s2.eq(d2), "{i} s2 != d2");
             }

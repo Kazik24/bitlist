@@ -1,4 +1,4 @@
-use crate::heap::{bit_in_word_index, is_invalid_index, is_invalid_range};
+use crate::heap::{bit_in_word_index, is_invalid_index, is_invalid_range, set_bit_value};
 use crate::iter::WordBits;
 use crate::wrapper::BitList;
 use std::num::NonZeroUsize;
@@ -99,16 +99,10 @@ impl InlineBitList {
         if index >= self.len() {
             return None;
         }
-        let mask = 1 << bit_in_word_index(index);
         //SAFETY: we just checked that index is in bound, so given word index will be valid for read/write
         //and calculated mask won't set any bits outside length
         let mut word = self.data();
-        let prev = word & mask != 0;
-        if value {
-            word |= mask;
-        } else {
-            word &= !mask;
-        }
+        let prev = set_bit_value(&mut word, index, value);
         self.set_data(word);
         Some(prev)
     }

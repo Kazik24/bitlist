@@ -311,18 +311,11 @@ impl HeapBitList {
         if index >= self.len() {
             return None;
         }
-        let mask = 1 << bit_in_word_index(index);
         //SAFETY: we just checked that index is in bound, so given word index will be valid for read/write
         //and calculated mask won't set any bits outside length
         unsafe {
             let word = &mut *self.data_ptr_mut().add(word_index(index));
-            let prev = *word & mask != 0;
-            if value {
-                *word |= mask;
-            } else {
-                *word &= !mask;
-            }
-            Some(prev)
+            Some(set_bit_value(word, index, value))
         }
     }
     pub const fn data_ptr(&self) -> *const usize {
@@ -494,6 +487,18 @@ pub(crate) const fn is_invalid_range(range: &Range<usize>, len: usize) -> bool {
         return true;
     }
     false
+}
+/// Set bit in word and return previous value, index is wrapping so bit index is `index % WORD_SIZE`
+#[inline]
+pub(crate) const fn set_bit_value(word: &mut usize, index: usize, value: bool) -> bool {
+    let mask = 1 << bit_in_word_index(index);
+    let prev = *word & mask != 0;
+    if value {
+        *word |= mask;
+    } else {
+        *word &= !mask;
+    }
+    prev
 }
 
 #[inline]

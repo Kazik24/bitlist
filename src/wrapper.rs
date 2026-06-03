@@ -96,7 +96,7 @@ impl BitList {
         }
     }
     #[inline]
-    pub(crate) fn inner_mut(&mut self) -> ReprMut<'_> {
+    pub(crate) const fn inner_mut(&mut self) -> ReprMut<'_> {
         // SAFETY: transmuting references here is safe cause both types have #[repr(transparent)]
         // with same size and alignment as NonZeroUsize, or just usize
         // then we check upfront which representation is it

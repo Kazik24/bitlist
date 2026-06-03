@@ -1,6 +1,8 @@
-use crate::heap::{HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, word_index, words_for};
+use crate::heap::{
+    HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, set_bit_value, word_index, words_for,
+};
 use crate::util::copy_bits_nonoverlapping;
-use crate::wrapper::{ReprByRef, ReprRef};
+use crate::wrapper::{ReprByRef, ReprMut, ReprRef};
 use crate::{BitList, InlineBitList};
 use std::alloc::Layout;
 use std::fmt::{Debug, Formatter};
@@ -14,10 +16,10 @@ use std::slice::from_raw_parts;
 
 impl BitList {
     pub const fn iter(&self) -> BitsIter<'_> {
-        match self.inner_by_ref() {
-            ReprByRef::Inline(inl) => BitsIter::from_inline_bounds(inl, Bound::Unbounded, Bound::Unbounded),
-            ReprByRef::Heap(v) => BitsIter::from_heap_bounds(v, Bound::Unbounded, Bound::Unbounded),
-        }
+        BitsIter::new_bounds(self, Bound::Unbounded, Bound::Unbounded)
+    }
+    pub const fn iter_mut(&mut self) -> BitsIterMut<'_> {
+        BitsIterMut::new_bounds(self, Bound::Unbounded, Bound::Unbounded)
     }
 
     pub fn range_iter<R: RangeBounds<usize>>(&self, range: R) -> BitsIter<'_> {
@@ -26,23 +28,35 @@ impl BitList {
             ReprByRef::Heap(v) => BitsIter::from_heap(v, range),
         }
     }
-    pub const fn range_iter_from(&self, start: usize) -> BitsIter<'_> {
-        match self.inner_by_ref() {
-            ReprByRef::Inline(inl) => BitsIter::from_inline_bounds(inl, Bound::Included(&start), Bound::Unbounded),
-            ReprByRef::Heap(v) => BitsIter::from_heap_bounds(v, Bound::Included(&start), Bound::Unbounded),
+    pub fn range_iter_mut<R: RangeBounds<usize>>(&mut self, range: R) -> BitsIterMut<'_> {
+        match self.inner_mut() {
+            ReprMut::Inline(inl) => BitsIterMut::from_inline(inl, range),
+            ReprMut::Heap(v) => BitsIterMut::from_heap(v, range),
         }
+    }
+    pub const fn range_iter_from(&self, start: usize) -> BitsIter<'_> {
+        BitsIter::new_bounds(self, Bound::Included(&start), Bound::Unbounded)
+    }
+    pub const fn range_iter_mut_from(&mut self, start: usize) -> BitsIterMut<'_> {
+        BitsIterMut::new_bounds(self, Bound::Included(&start), Bound::Unbounded)
+    }
+    pub const fn try_range_iter_mut_from(&mut self, start: usize) -> Option<BitsIterMut<'_>> {
+        if self.len() < start {
+            return None;
+        }
+        Some(BitsIterMut::new_bounds(self, Bound::Included(&start), Bound::Unbounded))
     }
     pub const fn range_iter_to(&self, end: usize) -> BitsIter<'_> {
-        match self.inner_by_ref() {
-            ReprByRef::Inline(inl) => BitsIter::from_inline_bounds(inl, Bound::Unbounded, Bound::Excluded(&end)),
-            ReprByRef::Heap(v) => BitsIter::from_heap_bounds(v, Bound::Unbounded, Bound::Excluded(&end)),
-        }
+        BitsIter::new_bounds(self, Bound::Unbounded, Bound::Excluded(&end))
+    }
+    pub const fn range_iter_mut_to(&mut self, end: usize) -> BitsIterMut<'_> {
+        BitsIterMut::new_bounds(self, Bound::Unbounded, Bound::Excluded(&end))
     }
     pub const fn range_iter_from_to(&self, start: usize, end: usize) -> BitsIter<'_> {
-        match self.inner_by_ref() {
-            ReprByRef::Inline(inl) => BitsIter::from_inline_bounds(inl, Bound::Included(&start), Bound::Excluded(&end)),
-            ReprByRef::Heap(v) => BitsIter::from_heap_bounds(v, Bound::Included(&start), Bound::Excluded(&end)),
-        }
+        BitsIter::new_bounds(self, Bound::Included(&start), Bound::Excluded(&end))
+    }
+    pub const fn range_iter_mut_from_to(&mut self, start: usize, end: usize) -> BitsIterMut<'_> {
+        BitsIterMut::new_bounds(self, Bound::Included(&start), Bound::Excluded(&end))
     }
 
     pub fn raw_words(&self) -> RawWordsIter<'_> {
@@ -110,6 +124,15 @@ impl<'a> BitsIter<'a> {
     #[inline]
     pub const fn empty() -> Self {
         Self { list_ptr: NonNull::dangling(), start: 0, stop: 0, _phantom: PhantomData }
+    }
+    pub fn new<R: RangeBounds<usize>>(list: &'a BitList, range: R) -> Self {
+        Self::new_bounds(list, range.start_bound(), range.end_bound())
+    }
+    pub const fn new_bounds(list: &'a BitList, start_bound: Bound<&usize>, end_bound: Bound<&usize>) -> Self {
+        match list.inner_by_ref() {
+            ReprByRef::Inline(inl) => Self::from_inline_bounds(inl, start_bound, end_bound),
+            ReprByRef::Heap(v) => Self::from_heap_bounds(v, start_bound, end_bound),
+        }
     }
     #[inline]
     pub const fn copy(&self) -> Self {
@@ -311,18 +334,42 @@ impl<'a> BitsIter<'a> {
     }
 
     pub fn to_list(self) -> BitList {
-        BitList::from_bits(self)
+        if let Some(l) = self.copy().to_inline_list() {
+            return BitList::from_inline(l);
+        }
+        let mut list = HeapBitList::with_capacity(self.len());
+
+        let data = list.uninit_data_mut();
+        if let Some(last) = data.last_mut() {
+            last.write(0); //initialize last word, requirement for copy
+        }
+        // SAFETY: with_capacity always returns list with proper size, and we initialized last word,
+        // first word is aligned to word boundary so it doesn't need to be initialized
+        // after copy retunrs all words 'words_for(len())' are initialized.
+        unsafe {
+            self.copy_bits_nonoverlapping(data.as_mut_ptr().cast::<usize>(), 0);
+            list.set_len(self.len());
+        }
+        BitList::from_heap(list)
     }
 
     #[inline]
     const fn read_word_at_bit_index(&self, index: usize) -> usize {
+        unsafe { self.word_ptr_at_bit_index(index).read() }
+    }
+    #[inline]
+    const fn word_ptr_at_bit_index(&self, index: usize) -> NonNull<usize> {
         debug_assert!(index >= self.start);
         debug_assert!(index < self.stop);
-        unsafe { self.read_word_unchecked(word_index(index)) }
+        unsafe { self.word_ptr_unchecked(word_index(index)) }
     }
     #[inline]
     const unsafe fn read_word_unchecked(&self, index: usize) -> usize {
-        unsafe { self.list_ptr.add(index).read() }
+        unsafe { self.word_ptr_unchecked(index).read() }
+    }
+    #[inline]
+    const unsafe fn word_ptr_unchecked(&self, index: usize) -> NonNull<usize> {
+        unsafe { self.list_ptr.add(index) }
     }
 
     pub const fn peek_word(&self) -> WordBits {
@@ -463,10 +510,10 @@ impl<'a> BitsIter<'a> {
         None
     }
 
-    pub fn rbit_position(&mut self, value: bool) -> Option<usize> {
-        let mut offset = self.len();
+    pub const fn rbit_position(&mut self, value: bool) -> Option<usize> {
+        let mut offset = (&*self).len();
         loop {
-            match self.next_back() {
+            match self.const_next_back() {
                 Some(val) if val == value => return Some(offset - 1),
                 Some(_) => offset -= 1,
                 None => break,
@@ -646,8 +693,8 @@ impl<'a> BitsIter<'a> {
     /// Copies all bits from this iterator to dst pointer, with bit offset of 'dst_bit_offset' into that pointer
     /// ## Safety:
     /// Caller must ensure that:
-    /// - dst pointer is valid for writes of at least `self.len()` bits, where start is rounded to previous word boundary
-    ///   and end are rounded to next word boundary.
+    /// - dst pointer is valid for writes of at least `self.len()` bits, where start )`dst_bit_offset`) is rounded to previous word boundary
+    ///   and end is rounded to next word boundary.
     /// - if `dst_bit_offset` is not aligned to word boundary, caller must ensure that first word in `dst` with bit
     ///   offset of `dst_bit_offset` is initialized
     /// - if `dst_bit_offset + self.len()` is not aligned to word boundary, caller must ensure that last word in `dst`
@@ -992,6 +1039,159 @@ impl Iterator for SetBitIndexes<'_> {
         self.list.next_set_bit(self.index).inspect(|index| {
             self.index = *index + 1;
         })
+    }
+}
+
+pub struct BitRefMut<'a> {
+    word: NonNull<usize>,
+    bit_index: u8,
+    _marker: PhantomData<&'a mut ()>,
+}
+
+impl<'a> BitRefMut<'a> {
+    const unsafe fn new(word: NonNull<usize>, bit_index: u8) -> Self {
+        debug_assert!(bit_index < HeapBitList::WORD_SIZE as _);
+        Self { word, bit_index, _marker: PhantomData }
+    }
+    pub const fn get(&self) -> bool {
+        unsafe { self.word.read().wrapping_shr(self.bit_index as _) & 1 != 0 }
+    }
+    pub const fn set(&mut self, value: bool) {
+        /// Safety, we have mutable access to the word and BitRefMut is !Send !Sync so only one thread can access this word
+        /// at given time
+        unsafe {
+            std::hint::assert_unchecked(self.bit_index < HeapBitList::WORD_SIZE as _);
+            set_bit_value(self.word.as_mut(), self.bit_index as _, value);
+        }
+    }
+    pub fn update(&mut self, f: impl FnOnce(bool) -> bool) {
+        self.set(f(self.get()));
+    }
+}
+
+#[repr(transparent)]
+pub struct BitsIterMut<'a> {
+    inner: BitsIter<'a>,
+    _phantom: PhantomData<&'a mut ()>,
+}
+
+impl<'a> BitsIterMut<'a> {
+    pub const fn new_bounds(list: &'a mut BitList, start_bound: Bound<&usize>, end_bound: Bound<&usize>) -> Self {
+        match list.inner_mut() {
+            ReprMut::Inline(inl) => Self::from_inline_bounds(inl, start_bound, end_bound),
+            ReprMut::Heap(v) => Self::from_heap_bounds(v, start_bound, end_bound),
+        }
+    }
+    #[inline]
+    pub fn from_inline<R: RangeBounds<usize>>(inline: &'a mut InlineBitList, range: R) -> Self {
+        Self::from_inline_bounds(inline, range.start_bound(), range.end_bound())
+    }
+    pub const fn from_inline_bounds(
+        inline: &'a mut InlineBitList,
+        start_bound: Bound<&usize>,
+        end_bound: Bound<&usize>,
+    ) -> Self {
+        let len = inline.len();
+        let range = bounds_to_range(start_bound, end_bound, len);
+        if is_invalid_range(&range, len) {
+            panic!("Invalid range");
+        }
+        Self {
+            inner: BitsIter {
+                list_ptr: NonNull::from_mut(inline).cast::<usize>(),
+                start: (InlineBitList::DATA_SHIFT as usize) + range.start,
+                stop: (InlineBitList::DATA_SHIFT as usize) + range.end,
+                _phantom: PhantomData,
+            },
+            _phantom: PhantomData,
+        }
+    }
+    #[inline]
+    pub(crate) fn from_heap<R: RangeBounds<usize>>(heap: &'a mut HeapBitList, range: R) -> Self {
+        Self::from_heap_bounds(heap, range.start_bound(), range.end_bound())
+    }
+    pub(crate) const fn from_heap_bounds(
+        heap: &'a mut HeapBitList,
+        start_bound: Bound<&usize>,
+        end_bound: Bound<&usize>,
+    ) -> Self {
+        let len = heap.len();
+        let range = bounds_to_range(start_bound, end_bound, len);
+        if is_invalid_range(&range, len) {
+            panic!("Invalid range");
+        }
+        Self {
+            inner: BitsIter {
+                list_ptr: unsafe { NonNull::new_unchecked(heap.data_ptr().cast_mut()) },
+                start: range.start,
+                stop: range.end,
+                _phantom: PhantomData,
+            },
+            _phantom: PhantomData,
+        }
+    }
+    pub const fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub const fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub const fn const_next(&mut self) -> Option<BitRefMut<'a>> {
+        if self.inner.start == self.inner.stop {
+            None
+        } else {
+            let word = self.inner.word_ptr_at_bit_index(self.inner.start);
+            let index = bit_in_word_index(self.inner.start);
+            self.inner.start += 1;
+            Some(unsafe { BitRefMut::new(word, index as _) })
+        }
+    }
+    pub const fn to_const(self) -> BitsIter<'a> {
+        self.inner
+    }
+    /// works as `.take(limit)` on iterator but doesn't change type and takes mutable reference, trurns true if limit was in bounds
+    pub const fn set_limit(&mut self, limit: usize) -> bool {
+        self.inner.set_limit(limit)
+    }
+    /// Move start to be 'limit' bits from end, returns true if limit was in bounds, false if limit was outside
+    pub const fn set_end_limit(&mut self, limit: usize) -> bool {
+        self.inner.set_end_limit(limit)
+    }
+    /// Similar to `.take(limit)` but doesn't change type
+    pub const fn with_limit(mut self, limit: usize) -> Self {
+        self.set_limit(limit);
+        self
+    }
+    pub const fn with_end_limit(mut self, limit: usize) -> Self {
+        self.set_end_limit(limit);
+        self
+    }
+    pub const fn fill(mut self, value: bool) {
+        while let Some(mut v) = self.const_next() {
+            v.set(value);
+        }
+    }
+    pub const fn copy_from(self, src: BitsIter<'_>) {
+        if self.len() != src.len() {
+            panic!("Different lengths");
+        }
+        // SAFETY: we have exclusive access to mutable region and consume iterators, list_ptr and start point to initialized memory
+        // that is read/write and we checked that access is in bounds
+        unsafe {
+            src.copy_bits_nonoverlapping(self.inner.list_ptr.as_ptr(), self.inner.start);
+        }
+    }
+}
+
+impl<'a> Iterator for BitsIterMut<'a> {
+    type Item = BitRefMut<'a>;
+    fn next(&mut self) -> Option<BitRefMut<'a>> {
+        self.const_next()
+    }
+}
+impl ExactSizeIterator for BitsIterMut<'_> {
+    fn len(&self) -> usize {
+        self.len()
     }
 }
 
