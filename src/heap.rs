@@ -88,7 +88,7 @@ impl HeapBitList {
         let cap = self.allocation_words();
         let len = words_for(self.len()) + Self::HEADER;
         debug_assert!(len <= cap);
-        let vec = ManuallyDrop::new(unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), cap, len) });
+        let vec = ManuallyDrop::new(unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), len, cap) });
         BorrowMutVec { parent: self, vec }
     }
 
@@ -109,20 +109,20 @@ impl HeapBitList {
         let cap = self.allocation_words();
         let len = words_for(self.len()) + Self::HEADER;
         debug_assert!(len <= cap);
-        unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), cap, len) }
+        unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), len, cap) }
     }
 
     /// #Safety
     /// The vec must have element at index 1 set to valid capacity in words (minus header size), and element at index 0
     /// is valid length in bits, also trailing bits in last world must be set to zero (if length is not multiple of word size).
     pub unsafe fn from_vec_memory(mut vec: Vec<usize>, update_capacity: bool) -> Self {
-        Self::assert_update_memory_vec(&mut vec, update_capacity);
+        Self::assert_update_memory_vec(&mut vec, update_capacity, true);
         //construct a HeapBitList
         let ptr = ManuallyDrop::new(vec).as_mut_ptr();
         Self { ptr: unsafe { NonNull::new_unchecked(ptr) } }
     }
 
-    fn assert_update_memory_vec(vec: &mut Vec<usize>, update_capacity: bool) {
+    fn assert_update_memory_vec(vec: &mut Vec<usize>, update_capacity: bool, check_last_word: bool) {
         //the smallest heap allocated list has only one word + header
         debug_assert!(vec.capacity() >= 1 + Self::HEADER);
 
@@ -139,6 +139,11 @@ impl HeapBitList {
         debug_assert!(vec[1] == vec.capacity() - Self::HEADER);
         //length is lower than capacity converted to bits
         debug_assert!(vec[1] * Self::WORD_SIZE >= vec[0]);
+        // check that last word bits are zero if lenght is not aligned to word boundary
+        if cfg!(debug_assertions) && check_last_word {
+            let idx = words_for(vec[0]).saturating_sub(1) + Self::HEADER;
+            assert!(vec[idx] & !last_word_mask(vec[0]) == 0, "last word: {:064b}, len: {}", vec[idx], vec[0]);
+        }
     }
 
     unsafe fn dealloc(&mut self) {
@@ -176,13 +181,13 @@ impl DerefMut for BorrowMutVec<'_> {
 }
 impl BorrowMutVec<'_> {
     pub fn set(mut self, update_capacity: bool) {
-        HeapBitList::assert_update_memory_vec(&mut self.vec, update_capacity);
+        HeapBitList::assert_update_memory_vec(&mut self.vec, update_capacity, true);
         drop(self);
     }
 }
 impl Drop for BorrowMutVec<'_> {
     fn drop(&mut self) {
-        HeapBitList::assert_update_memory_vec(&mut self.vec, false);
+        HeapBitList::assert_update_memory_vec(&mut self.vec, false, true);
         unsafe {
             self.parent.ptr = NonNull::new_unchecked(self.vec.as_mut_ptr());
         }
@@ -336,7 +341,7 @@ impl HeapBitList {
     /// (panics if length is greater than capacity)
     pub fn words_for_init(&mut self, new_len: usize) -> &mut [MaybeUninit<usize>] {
         if new_len > self.capacity() {
-            panic!("Length is greater than capacity");
+            panic!("Length is greater than capacity, new_len = {new_len}, capacity = {}", self.capacity());
         }
         let len = words_for(new_len);
         unsafe {
@@ -395,12 +400,11 @@ impl HeapBitList {
     }
 
     pub fn try_ensure_capacity(&mut self, new_cap: usize) -> Result<(), AllocateError> {
-        let old_cap = self.capacity();
-        if new_cap <= old_cap {
+        if new_cap <= self.capacity() {
             return Ok(());
         }
         unsafe {
-            let additional = words_for(new_cap) - words_for(old_cap);
+            let additional = words_for(new_cap) - words_for(self.len());
             let mut vec = self.memory_mut_vec();
             vec.try_reserve(additional).map_err(AllocateError::Internal)?;
             vec.set(true);

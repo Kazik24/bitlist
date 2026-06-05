@@ -1,7 +1,7 @@
 use crate::heap::{
     HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, set_bit_value, word_index, words_for,
 };
-use crate::util::copy_bits_nonoverlapping;
+use crate::util::{copy_bits_nonoverlapping, fill_bits};
 use crate::wrapper::{ReprByRef, ReprMut, ReprRef};
 use crate::{BitList, InlineBitList};
 use std::alloc::Layout;
@@ -421,7 +421,7 @@ impl<'a> BitsIter<'a> {
         }
         let idx = bit_in_word_index(self.stop);
         let mut word = self.read_word_at_bit_index(if idx == 0 { self.stop - 1 } else { self.stop });
-        println!("idx: {}", idx); //todo
+        //println!("idx: {}", idx); //todo
         let rest = HeapBitList::WORD_SIZE - idx;
         let min = if rest < len { rest } else { len };
         WordBits::new(word, min as _)
@@ -1167,8 +1167,9 @@ impl<'a> BitsIterMut<'a> {
         self
     }
     pub const fn fill(mut self, value: bool) {
-        while let Some(mut v) = self.const_next() {
-            v.set(value);
+        /// SAFETY: bound of self.inner are always checked to be valid
+        unsafe {
+            fill_bits(self.inner.list_ptr.as_ptr(), self.inner.start, self.len(), value);
         }
     }
     pub const fn copy_from(self, src: BitsIter<'_>) {

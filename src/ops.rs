@@ -3,7 +3,7 @@ use crate::BitsIter;
 use crate::heap::{HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, word_index, words_for};
 use crate::inline::InlineBitList;
 use crate::iter::bounds_to_range;
-use crate::util::{copy_bits_nonoverlapping, for_each_carry, unary_for_each_carry};
+use crate::util::{copy_bits_nonoverlapping, fill_bits, for_each_carry, unary_for_each_carry};
 use crate::wrapper::{ReprByRef, ReprMut, ReprRef};
 use std::alloc::Layout;
 use std::cmp::Ordering;
@@ -75,7 +75,8 @@ impl BitList {
         let mut list = HeapBitList::zeros(length);
         let value = if length >= 128 { value } else { value & ((1 << length) - 1) };
         let mut bytes = value.to_le_bytes();
-        let chunks = bytes.chunks(HeapBitList::WORD_BYTES).map(|v| usize::from_le_bytes(v.try_into().unwrap()));
+        const WB: usize = HeapBitList::WORD_BYTES;
+        let chunks = bytes.as_chunks::<WB>().0.iter().map(|v| usize::from_le_bytes(*v));
         list.init_from(chunks);
         Self::from_heap(list)
     }
@@ -475,8 +476,26 @@ impl BitList {
         self.push_list(&Self::single(bit));
     }
     pub fn push_many_bits(&mut self, bit: bool, count: usize) {
-        for _ in 0..count {
-            self.push_bit(bit);
+        self.reserve(count);
+        match self.inner_mut() {
+            ReprMut::Inline(v) => {
+                let len = v.len() + count;
+                let data = v.data() | usize::MAX.wrapping_shl(v.len() as _);
+                *v = InlineBitList::new(data, len as _);
+            }
+            ReprMut::Heap(v) => {
+                let len = v.len() + count; // reserve() checked that this will never overflow
+                if words_for(v.len()) != words_for(len) {
+                    if let Some(last) = v.words_for_init(len).last_mut() {
+                        last.write(0); // init last uninit word - requirement for copy
+                    }
+                }
+                // SAFETY: we resized the list to be big enough and last word is initialized
+                unsafe {
+                    fill_bits(v.data_ptr_mut(), v.len(), count, bit);
+                    v.set_len(len);
+                }
+            }
         }
     }
     pub fn concat(&self, msb: &BitList) -> Self {
@@ -485,76 +504,34 @@ impl BitList {
         list
     }
 
-    pub fn push_list(&mut self, value: &BitList) {
-        self.reserve(value.len());
+    pub fn push_bits(&mut self, mut bits: BitsIter<'_>) {
+        self.reserve(bits.len());
         match self.inner_mut() {
             ReprMut::Inline(v) => {
-                let (vlen, first, rest) = value.decompose();
-                let len = v.len() + vlen;
-                let data = v.data() | first << v.len();
+                let word = bits.next_unaligned_word();
+                let len = v.len() + word.len();
+                let data = v.data() | word.raw() << v.len();
                 *v = InlineBitList::new(data, len as _);
             }
-            ReprMut::Heap(v) => match value.inner() {
-                ReprRef::Inline(o) => {
-                    let curr_len = v.len();
-                    let new_len = curr_len.checked_add(o.len()).expect("Length overflow");
-                    let last_len = curr_len % HeapBitList::WORD_SIZE;
-                    if last_len == 0 {
-                        //next word can be added
-                        unsafe {
-                            v.data_ptr_mut().add(words_for(curr_len)).write(o.data());
-                            v.set_len(new_len);
-                        }
-                    } else if (last_len + o.len()) > HeapBitList::WORD_SIZE {
-                        //additional word
-                        let mask = last_word_mask(last_len);
-                        let rot = o.data().rotate_left(last_len as _);
-                        let offset = words_for(curr_len) - 1;
-                        unsafe {
-                            let ptr = v.data_ptr_mut().add(offset);
-                            *ptr |= !mask & rot;
-                            ptr.add(1).write(rot & mask);
-                            v.set_len(new_len);
-                        }
-                    } else {
-                        //unaligned write bits
+            ReprMut::Heap(v) => {
+                let new_len = v.len() + bits.len(); // reserve() checked that this will never overflow
+                if words_for(v.len()) != words_for(new_len) {
+                    if let Some(last) = v.words_for_init(new_len).last_mut() {
+                        last.write(0); // init last uninit word - requirement for copy
+                    }
+                }
 
-                        unsafe {
-                            let last = v.data_ptr_mut().add(words_for(curr_len) - 1);
-                            *last |= o.data().wrapping_shl(last_len as _);
-                            v.set_len(new_len);
-                        }
-                    }
+                // SAFETY: we resized the list to be big enough and last word is initialized
+                unsafe {
+                    bits.copy_bits_nonoverlapping(v.data_ptr_mut(), v.len());
+                    v.set_len(new_len);
                 }
-                ReprRef::Heap(o) => {
-                    let curr_len = v.len();
-                    let len = o.len();
-                    let new_len = curr_len.checked_add(len).expect("Length overflow");
-                    if curr_len % HeapBitList::WORD_SIZE == 0 {
-                        //data is word aligned
-                        unsafe {
-                            let end = v.data_ptr_mut().add(words_for(curr_len));
-                            end.copy_from_nonoverlapping(o.data_ptr(), words_for(len));
-                            v.set_len(new_len);
-                        }
-                    } else if curr_len % 8 == 0 {
-                        //data is byte aligned
-                        let last_idx = words_for(new_len) - 1;
-                        v.uninit_data_mut()[last_idx] = MaybeUninit::new(0); //keep all bytes at end initialized
-                        unsafe {
-                            let bytes_offset = words_for(curr_len) * size_of::<usize>();
-                            let end = v.data_ptr_mut().cast::<u8>().add(bytes_offset);
-                            let bytes = words_for(len) * size_of::<usize>();
-                            end.copy_from_nonoverlapping(o.data_ptr().cast(), bytes);
-                            v.set_len(new_len);
-                        }
-                    } else {
-                        //data is unaligned
-                        todo!()
-                    }
-                }
-            },
+            }
         }
+    }
+
+    pub fn push_list(&mut self, value: &BitList) {
+        self.push_bits(value.iter());
     }
 
     pub fn repeat(&mut self, count: usize) {

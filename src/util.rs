@@ -164,7 +164,7 @@ pub const unsafe fn copy_bits_nonoverlapping(
     }
 }
 
-pub unsafe fn fill_bits(dst: *mut usize, dst_bit_offset: usize, bit_count: usize, value: bool) {
+pub const unsafe fn fill_bits(dst: *mut usize, dst_bit_offset: usize, bit_count: usize, value: bool) {
     if bit_count == 0 {
         return;
     }
@@ -187,27 +187,23 @@ pub unsafe fn fill_bits(dst: *mut usize, dst_bit_offset: usize, bit_count: usize
         }
         let first_byte = dst.read();
         let mut end = dst_bit_offset + bit_count;
-        println!("first_byte: {first_byte:08b}, dst_bit_offset: {dst_bit_offset}, end: {end}");
         if end < 8 {
-            let mask = !last_byte_mask(dst_bit_offset + 1) & last_byte_mask(end);
-            println!("mask: {:08b}", mask);
+            let mask = !last_byte_mask(dst_bit_offset) & last_byte_mask(end);
             let new_byte = if value { first_byte | mask } else { first_byte & !mask };
             dst.write(new_byte);
             return;
         } else {
-            let mask = last_byte_mask(dst_bit_offset + 1);
-            println!("mask rest: {:08b}", mask);
+            let mask = !last_byte_mask(dst_bit_offset);
             let new_byte = if value { first_byte | mask } else { first_byte & !mask };
             dst.write(new_byte);
         }
         let dst = dst.add(1);
-        end -= (7 - dst_bit_offset);
+        end -= 8;
         let whole_bytes_len = byte_index(end);
         dst.write_bytes(if value { 0xff } else { 0 }, whole_bytes_len);
-        println!("whole_bytes_len: {whole_bytes_len}, end: {end}");
         if bit_in_byte_index(end) != 0 {
             let mask = last_byte_mask(end);
-            println!("mask: {:08b}", mask);
+            //println!("mask: {:08b}", mask);
             let dst_byte_ptr = dst.add(whole_bytes_len);
             let new_byte = if value { dst_byte_ptr.read() | mask } else { dst_byte_ptr.read() & !mask };
             dst_byte_ptr.write(new_byte);
@@ -286,8 +282,6 @@ mod tests {
                 // check that regions are equal
                 let src_region = BitsIter::new_unchecked(src_ptr, src_off, bit_len);
                 let dst_region = BitsIter::new_unchecked(dst_ptr, dst_off, bit_len);
-                // println!("src: {:?}", src_region.copy().to_list());
-                // println!("dst: {:?}", dst_region.copy().to_list());
                 let equal = src_region.eq(dst_region);
                 assert!(
                     equal,
@@ -313,6 +307,18 @@ mod tests {
                 time / counter
             );
         }
+    }
+
+    #[test]
+    fn test_fill_bits_base() {
+        let mem = &mut [usize::MAX; 1];
+        let ptr = mem.as_mut_ptr();
+        let bit_len = 0;
+        unsafe { fill_bits(ptr, 7, 9, false) };
+        println!("{:064b}", mem[0]);
+        let exp = usize::MAX ^ 0b11111111_10000000;
+        println!("{:064b}", exp);
+        assert_eq!(mem[0], exp);
     }
 
     #[test]
@@ -353,9 +359,7 @@ mod tests {
 
                 // check that regions are equal
                 let dst_region = BitsIter::new_unchecked(dst_ptr, dst_off, bit_len);
-                // println!("src: {:?}", src_region.copy().to_list());
-                println!("dst: {:?}", dst_region.copy().to_list());
-                let equal = dst_region.all_value() == Some(value);
+                let equal = dst_region.copy().all_value() == Some(value) || dst_region.is_empty();
                 assert!(
                     equal,
                     "{i} Bits are not equal - dst_ptr_off: {dst_ptr_off}, dst_off: {dst_off}, bit_len: {bit_len}"
@@ -368,8 +372,6 @@ mod tests {
                 let soff = dst_ptr_bit_off + dst_off + bit_len;
                 let s2 = BitsIter::new_unchecked_range(dst.as_ptr(), soff..(MEM * WordBits::BITS as usize));
                 let d2 = BitsIter::new_unchecked_range(dst_snapshot.as_ptr(), soff..(MEM * WordBits::BITS as usize));
-                println!("s1: {:b}", s1.copy().to_list());
-                println!("d1: {:b}", d1.copy().to_list());
                 assert!(s1.eq(d1), "{i} s1 != d1");
                 assert!(s2.eq(d2), "{i} s2 != d2");
             }
