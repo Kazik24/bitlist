@@ -492,6 +492,13 @@ pub(crate) const fn is_invalid_range(range: &Range<usize>, len: usize) -> bool {
     }
     false
 }
+#[inline]
+pub(crate) const fn bcd_size_for_bits(bit_len: usize) -> usize {
+    if bit_len <= 3 {
+        return 4;
+    }
+    bit_len + ((bit_len - 4) / 3) + 1
+}
 /// Set bit in word and return previous value, index is wrapping so bit index is `index % WORD_SIZE`
 #[inline]
 pub(crate) const fn set_bit_value(word: &mut usize, index: usize, value: bool) -> bool {

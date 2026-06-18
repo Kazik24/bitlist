@@ -1,6 +1,8 @@
 use super::wrapper::BitList;
 use crate::BitsIter;
-use crate::heap::{HeapBitList, bit_in_word_index, is_invalid_range, last_word_mask, word_index, words_for};
+use crate::heap::{
+    HeapBitList, bcd_size_for_bits, bit_in_word_index, is_invalid_range, last_word_mask, word_index, words_for,
+};
 use crate::inline::InlineBitList;
 use crate::iter::bounds_to_range;
 use crate::util::{copy_bits_nonoverlapping, fill_bits, for_each_carry, unary_for_each_carry};
@@ -247,11 +249,11 @@ impl BitList {
         //           bcd[W-i+4*j -: 4] = bcd[W-i+4*j -: 4] + 4'd3; // add 3
         let len = self.len();
         let mut bcd = self.clone();
+        bcd.resize(bcd_size_for_bits(len), Some(false));
         if len <= 3 {
-            bcd.resize(4, Some(false)); // 3 bits or less it always one digit
+            // 3 bits or less it always one digit
             return bcd;
         }
-        bcd.resize(len + ((len - 4) / 3) + 1, Some(false));
         for i in 0..=(len - 4) {
             // iterate on structure depth
             for j in 0..=(i / 3) {
@@ -260,10 +262,10 @@ impl BitList {
                 //    bcd[W-i+4*j -: 4] = bcd[W-i+4*j -: 4] + 4'd3; // add 3
 
                 let idx = len - i + (4 * j) - 3;
-                let value = bcd.get_byte_at(idx).unwrap() & 0xf;
+                let value = bcd.get_value_at(idx, 4).unwrap();
                 if value > 4 {
                     let update = (value + 3) & 0xf;
-                    bcd.set_byte_at(idx, update, 4);
+                    bcd.set_byte_at(idx, update as _, 4);
                 }
             }
         }
@@ -368,10 +370,8 @@ impl BitList {
                 } else {
                     let fill = fill.unwrap_or_else(|| l.last_bit().unwrap_or(false));
                     l.try_ensure_capacity(new_len).unwrap();
-                    if fill {
-                        if let Some(v) = l.init_data_mut().last_mut() {
-                            *v |= !last_word_mask(len); //fill remaining bits
-                        }
+                    if fill && let Some(v) = l.init_data_mut().last_mut() {
+                        *v |= !last_word_mask(len); //fill remaining bits
                     }
                     let uninit = &mut l.uninit_data_mut()[words_for(len)..words_for(new_len)];
                     let to_fill = if fill { usize::MAX } else { 0 };
@@ -473,7 +473,7 @@ impl BitList {
     }
 
     pub fn push_bit(&mut self, bit: bool) {
-        self.push_list(&Self::single(bit));
+        self.push_bits(BitsIter::single(bit));
     }
     pub fn push_many_bits(&mut self, bit: bool, count: usize) {
         self.reserve(count);
@@ -816,54 +816,71 @@ impl BitList {
         }
     }
 
-    pub fn get_byte_at(&self, index: usize) -> Option<u8> {
-        const SIZE: usize = u8::BITS as _;
-        match self.inner() {
-            ReprRef::Inline(v) => {
-                if index >= v.len() {
-                    None
-                } else {
-                    Some(v.data().wrapping_shr(index as u32) as u8)
-                }
-            }
-            ReprRef::Heap(v) => {
-                if index >= v.len() {
-                    None
-                } else {
-                    let words = v.init_data();
-                    let first_index = word_index(index);
-                    let bit_index = bit_in_word_index(index);
-                    let first = words[first_index].wrapping_shr(bit_index as _);
-                    //check if byte is in this word only (also handle edge case when overflowing usize)
-                    let next_idx = index.checked_add(SIZE - 1).map(word_index);
-                    if next_idx == Some(first_index) || next_idx.is_none() {
-                        return Some(first as u8);
-                    }
-                    let byte_split = bit_index - (HeapBitList::WORD_SIZE - SIZE);
-                    let second =
-                        words.get(first_index + 1).copied().unwrap_or(0).wrapping_shl((SIZE - byte_split) as _); //never fails
-
-                    //println!("{index}, first_index: {first_index}, next_idx: {next_idx:?}, byte_split: {byte_split}");
-
-                    Some((first | second) as u8)
-                }
-            }
+    pub const fn get_value_at(&self, index: usize, bits: usize) -> Option<u32> {
+        match self.try_range_iter_from(index) {
+            Some(mut iter) if !iter.is_empty() => Some(iter.next_bits(bits).raw() as u32),
+            Some(_) | None => None,
         }
+    }
+    pub const fn get_byte_at(&self, index: usize) -> Option<u8> {
+        match self.get_value_at(index, 8) {
+            Some(v) => Some(v as u8),
+            None => None,
+        }
+        // const SIZE: usize = u8::BITS as _;
+        // self.try_range_iter_from(index)?.next_bits(SIZE);
+
+        // match self.inner() {
+        //     ReprRef::Inline(v) => {
+        //         if index >= v.len() {
+        //             None
+        //         } else {
+        //             Some(v.data().wrapping_shr(index as u32) as u8)
+        //         }
+        //     }
+        //     ReprRef::Heap(v) => {
+        //         if index >= v.len() {
+        //             None
+        //         } else {
+        //             let words = v.init_data();
+        //             let first_index = word_index(index);
+        //             let bit_index = bit_in_word_index(index);
+        //             let first = words[first_index].wrapping_shr(bit_index as _);
+        //             //check if byte is in this word only (also handle edge case when overflowing usize)
+        //             let next_idx = index.checked_add(SIZE - 1).map(word_index);
+        //             if next_idx == Some(first_index) || next_idx.is_none() {
+        //                 return Some(first as u8);
+        //             }
+        //             let byte_split = bit_index - (HeapBitList::WORD_SIZE - SIZE);
+        //             let second =
+        //                 words.get(first_index + 1).copied().unwrap_or(0).wrapping_shl((SIZE - byte_split) as _); //never fails
+
+        //             //println!("{index}, first_index: {first_index}, next_idx: {next_idx:?}, byte_split: {byte_split}");
+
+        //             Some((first | second) as u8)
+        //         }
+        //     }
+        // }
     }
     pub fn set_byte_at(&mut self, index: usize, value: u8, value_len: usize) {
         assert!(value_len <= 8);
-        match self.inner_mut() {
-            ReprMut::Inline(inl) => {
-                if !inl.set_at(index, InlineBitList::new_masked(value as _, value_len as _)) {
-                    panic!("Value placed outside bit range.");
-                }
-            }
-            ReprMut::Heap(alc) => {
-                if !alc.set_at(index, &BitList::from_inline(InlineBitList::new_masked(value as _, value_len as _))) {
-                    panic!("Value placed outside bit range.");
-                }
-            }
-        }
+        // match self.inner_mut() {
+        //     ReprMut::Inline(inl) => {
+        //         if !inl.set_at(index, InlineBitList::new_masked(value as _, value_len as _)) {
+        //             panic!("Value placed outside bit range.");
+        //         }
+        //     }
+        //     ReprMut::Heap(alc) => {
+        //         if !alc.set_at(index, &BitList::from_inline(InlineBitList::new_masked(value as _, value_len as _))) {
+        //             panic!("Value placed outside bit range.");
+        //         }
+        //     }
+        // }
+        let inl = InlineBitList::new_masked(value as _, value_len as _);
+        self.set_bits_at(index, inl.as_list().iter());
+    }
+    pub fn set_bits_at(&mut self, index: usize, value: BitsIter<'_>) {
+        self.range_iter_mut_from(index).with_limit(value.len()).copy_from(value);
     }
     pub const fn last_bit(&self) -> Option<bool> {
         // assembly difference between this and `self.get_bit(self.len().checked_sub(1)?)`
@@ -1173,6 +1190,7 @@ mod tests {
     use std::collections::HashSet;
     use std::fmt::format;
     use std::ops::Range;
+    use std::time::{Duration, Instant};
 
     fn generate_lists(rng: &mut impl Rng, ranges: impl IntoIterator<Item = usize>) -> Vec<BitList> {
         ranges.into_iter().map(|len| BitList::from_bits((0..len).map(|_| rng.random_bool(0.5)))).collect()
@@ -1416,6 +1434,27 @@ mod tests {
     }
 
     #[test]
+    fn test_bcd_random() {
+        let rng = &mut StdRng::seed_from_u64(98765132);
+        let mut data = [0usize; 64];
+
+        let mut dur = Duration::ZERO;
+        let mut count = 0u32;
+        for _ in 0..10 {
+            unsafe { rng.fill_bytes(&mut data.align_to_mut::<u8>().1) };
+            let iter = BitsIter::from_full_words(&data);
+            let len = rng.random_range(0..iter.len());
+            let list = BitList::from_bits(iter.with_limit(len));
+            let start = Instant::now();
+            let val = list.unsigned_binary_to_bcd();
+            dur += start.elapsed();
+            count += 1;
+            std::hint::black_box(val);
+        }
+        println!("Avg bin to bcd: {:?}", dur / count);
+    }
+
+    #[test]
     fn test_get_byte() {
         let bits = "10101010_11100111_11000011_10000001_00000000_11110000_11100011_11001100_01010101".replace("_", "");
         let v = BitList::parse_bits(&bits).unwrap();
@@ -1429,6 +1468,7 @@ mod tests {
             let byte = format!("{:08b}", v.get_byte_at(i).unwrap());
             assert_eq!(vals, byte, "index {i}");
         }
+        assert!(v.get_byte_at(v.len()).is_none());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 #![doc = include_str!("../README.md")]
 
 mod basic_math;
-mod bitlist;
+// mod bitlist;
 mod convert;
 mod heap;
 mod inline;

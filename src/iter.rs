@@ -6,6 +6,7 @@ use crate::wrapper::{ReprByRef, ReprMut, ReprRef};
 use crate::{BitList, InlineBitList};
 use std::alloc::Layout;
 use std::fmt::{Debug, Formatter};
+use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem::{MaybeUninit, transmute};
@@ -36,6 +37,12 @@ impl BitList {
     }
     pub const fn range_iter_from(&self, start: usize) -> BitsIter<'_> {
         BitsIter::new_bounds(self, Bound::Included(&start), Bound::Unbounded)
+    }
+    pub const fn try_range_iter_from(&self, start: usize) -> Option<BitsIter<'_>> {
+        if self.len() < start {
+            return None;
+        }
+        Some(BitsIter::new_bounds(self, Bound::Included(&start), Bound::Unbounded))
     }
     pub const fn range_iter_mut_from(&mut self, start: usize) -> BitsIterMut<'_> {
         BitsIterMut::new_bounds(self, Bound::Included(&start), Bound::Unbounded)
@@ -140,6 +147,10 @@ impl<'a> BitsIter<'a> {
         Self { list_ptr: self.list_ptr, start: self.start, stop: self.stop, _phantom: PhantomData }
     }
     #[inline]
+    pub const fn single(value: bool) -> Self {
+        if value { Self::from_array_words(&[1]).with_limit(1) } else { Self::from_array_words(&[0]).with_limit(1) }
+    }
+    #[inline]
     pub const fn len(&self) -> usize {
         self.stop - self.start
     }
@@ -155,6 +166,10 @@ impl<'a> BitsIter<'a> {
         debug_assert!(start.checked_add(length).is_some());
         unsafe { Self::new_unchecked_range(list_ptr, start..start + length) }
     }
+    /// # Safety
+    /// You need to ensure that list_ptr points to initialized memory valid for read on bit range `range`
+    /// and that `range.start <= range.end`
+    #[inline]
     pub const unsafe fn new_unchecked_range(list_ptr: *const usize, range: Range<usize>) -> Self {
         debug_assert!(range.start <= range.end);
         Self {
@@ -461,7 +476,7 @@ impl<'a> BitsIter<'a> {
         debug_assert!(self.start <= self.stop);
         // check if word aligned (only applicable if it's not the last word)
         if cfg!(debug_assertions) && self.start != self.stop {
-            debug_assert!(self.start % HeapBitList::WORD_SIZE == 0);
+            debug_assert!(self.start.is_multiple_of(HeapBitList::WORD_SIZE));
         }
         debug_assert!(self.stop <= usize::MAX - HeapBitList::WORD_SIZE, "overflow guard");
 
@@ -691,7 +706,7 @@ impl<'a> BitsIter<'a> {
     }
 
     /// Copies all bits from this iterator to dst pointer, with bit offset of 'dst_bit_offset' into that pointer
-    /// ## Safety:
+    /// # Safety
     /// Caller must ensure that:
     /// - dst pointer is valid for writes of at least `self.len()` bits, where start )`dst_bit_offset`) is rounded to previous word boundary
     ///   and end is rounded to next word boundary.
@@ -699,7 +714,6 @@ impl<'a> BitsIter<'a> {
     ///   offset of `dst_bit_offset` is initialized
     /// - if `dst_bit_offset + self.len()` is not aligned to word boundary, caller must ensure that last word in `dst`
     ///   with bit offset of `dst_bit_offset + self.len()` is initialized
-    ///
     pub const unsafe fn copy_bits_nonoverlapping(&self, dst: *mut usize, dst_bit_offset: usize) {
         unsafe {
             copy_bits_nonoverlapping(self.list_ptr.as_ptr().cast_const(), self.start, dst, dst_bit_offset, self.len());
@@ -717,6 +731,9 @@ impl<'a> BitsIter<'a> {
         unsafe {
             self.copy_bits_nonoverlapping(dst.as_mut_ptr(), dst_bit_offset);
         }
+    }
+    pub const fn copy_to(self, dst: BitsIterMut<'a>) {
+        dst.copy_from(self);
     }
 }
 
@@ -762,7 +779,7 @@ impl ExactSizeIterator for BitsIter<'_> {
 }
 impl FusedIterator for BitsIter<'_> {}
 
-#[derive(Copy, Clone, Eq, Hash)]
+#[derive(Copy, Clone, Eq)]
 pub struct WordBits {
     /// only first `count` bits are valid, other bits are undefined and can be have any value, so before
     /// returing this word please sanitize it by masking bits outside `count`
@@ -896,6 +913,12 @@ impl PartialEq for WordBits {
     fn eq(&self, other: &Self) -> bool {
         let xor = self.value ^ other.value;
         self.count == other.count && xor & last_word_mask(self.count as _) == 0
+    }
+}
+impl Hash for WordBits {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.raw().hash(state);
+        self.count.hash(state);
     }
 }
 
@@ -1181,6 +1204,9 @@ impl<'a> BitsIterMut<'a> {
         unsafe {
             src.copy_bits_nonoverlapping(self.inner.list_ptr.as_ptr(), self.inner.start);
         }
+    }
+    pub const fn copy_to(self, dst: BitsIterMut<'_>) {
+        self.to_const().copy_to(dst);
     }
 }
 
