@@ -148,7 +148,9 @@ impl<'a> BitsIter<'a> {
     }
     #[inline]
     pub const fn single(value: bool) -> Self {
-        if value { Self::from_array_words(&[1]).with_limit(1) } else { Self::from_array_words(&[0]).with_limit(1) }
+        static ONE: [usize; 1] = [1];
+        static ZERO: [usize; 1] = [0];
+        if value { Self::from_array_words(&ONE).with_limit(1) } else { Self::from_array_words(&ZERO).with_limit(1) }
     }
     #[inline]
     pub const fn len(&self) -> usize {

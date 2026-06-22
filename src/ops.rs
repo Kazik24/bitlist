@@ -481,7 +481,7 @@ impl BitList {
             ReprMut::Inline(v) => {
                 let len = v.len() + count;
                 let data = v.data() | usize::MAX.wrapping_shl(v.len() as _);
-                *v = InlineBitList::new(data, len as _);
+                *v = InlineBitList::new_masked(data, len as _);
             }
             ReprMut::Heap(v) => {
                 let len = v.len() + count; // reserve() checked that this will never overflow
@@ -532,6 +532,12 @@ impl BitList {
 
     pub fn push_list(&mut self, value: &BitList) {
         self.push_bits(value.iter());
+    }
+
+    pub fn pop_bit(&mut self) -> Option<bool> {
+        let last = self.last_bit()?;
+        self.truncate(self.len() - 1);
+        Some(last)
     }
 
     pub fn repeat(&mut self, count: usize) {

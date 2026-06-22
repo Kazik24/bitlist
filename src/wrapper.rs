@@ -214,7 +214,7 @@ impl PartialEq for BitList {
                     //unwrap should never be reached
                     return a.data() == b.first_word_init().unwrap_or(0);
                 }
-                false
+                true
             }
         }
     }
@@ -243,6 +243,31 @@ impl Drop for BitList {
             unsafe {
                 drop(transmute::<NonZeroPtr, HeapBitList>(self.val));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::prelude::*;
+
+    #[test]
+    fn test_list_eq() {
+        let rng = &mut StdRng::seed_from_u64(1234566543);
+        for _ in 0..1000 {
+            let to_push = rng.random_range(0..100);
+            let to_pop = rng.random_range(0..100);
+            let mut list = BitList::NO_BITS;
+            for _ in 0..to_push {
+                list.push_bit(rng.random_bool(0.5));
+            }
+            for _ in 0..to_pop {
+                list.pop_bit();
+            }
+            let bits = list.iter().collect::<Vec<_>>();
+            let cmp_list = BitList::from_bits(bits.iter().copied());
+            assert_eq!(list, cmp_list);
         }
     }
 }
