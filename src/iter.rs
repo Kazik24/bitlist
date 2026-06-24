@@ -737,6 +737,66 @@ impl<'a> BitsIter<'a> {
     pub const fn copy_to(self, dst: BitsIterMut<'a>) {
         dst.copy_from(self);
     }
+
+    pub const fn next_bit_count(&mut self) -> (bool, usize) {
+        let Some(next) = self.const_next() else {
+            return (false, 0);
+        };
+        if let Some(offset) = self.copy().bit_position(!next) {
+            self.start += offset;
+            return (next, offset + 1);
+        }
+        let len = (&*self).len();
+        if len != 0 {
+            self.start = self.stop;
+            return (next, len + 1);
+        }
+        (next, 1)
+    }
+
+    pub fn into_bit_counts(mut self) -> impl Iterator<Item = (bool, usize)> {
+        std::iter::from_fn(move || {
+            let (next, next_count) = self.next_bit_count();
+            (next_count != 0).then_some((next, next_count))
+        })
+    }
+
+    /// Returns entropy of bits, if less than 1, it means that list can be compressed to smaller size, >1 will result in bigger compressed list.
+    /// Empty list has entropy of 0
+    pub const fn entropy(&self) -> f64 {
+        let len = self.len();
+        if len == 0 {
+            return 0.0;
+        }
+        let mut it = self.copy();
+        let mut compressed_count = 0;
+        loop {
+            let bits = it.compress_next();
+            if bits.is_empty() {
+                break;
+            }
+            compressed_count += bits.len();
+        }
+        compressed_count as f64 / len as f64
+    }
+    pub fn compress_run_length(mut self) -> BitList {
+        let mut list = BitList::new();
+        loop {
+            let bits = self.compress_next();
+            if bits.is_empty() {
+                break;
+            }
+            list.push_bits(bits.iter());
+        }
+        list
+    }
+
+    pub const fn compress_next(&mut self) -> WordBits {
+        let (bit, count) = self.copy().next_bit_count();
+        let (bits, rest) = WordBits::compress_run_length(bit, count as u64);
+        self.start += count - rest as usize;
+        bits
+    }
 }
 
 impl Iterator for BitsIter<'_> {
@@ -837,6 +897,9 @@ impl WordBits {
     pub const fn first_bit_value(self, value: bool) -> Option<u16> {
         if value { self.first_set_bit() } else { self.first_clr_bit() }
     }
+    pub const fn iter(&self) -> BitsIter<'_> {
+        BitsIter::from_array_words(std::array::from_ref(&self.value)).with_limit(self.len())
+    }
     #[inline]
     pub const fn truncate(&mut self, count: usize) {
         let max_count = if count > Self::BITS as _ { Self::BITS } else { count as u16 };
@@ -895,6 +958,45 @@ impl WordBits {
             return Some(InlineBitList::new_masked(self.value, self.count as _));
         }
         None
+    }
+
+    pub const fn compress_run_length(bit: bool, count: u64) -> (WordBits, u64) {
+        const fn mask_bit_len(mask: usize, bit: bool, bit_sh: u32, size: u64, size_sh: u32) -> usize {
+            mask | (bit as usize).wrapping_shl(bit_sh) | (size as usize).wrapping_shl(size_sh)
+        }
+        const fn mask(bits: u32) -> u64 {
+            (1 << bits) - 1
+        }
+
+        const RANGE1: u32 = 4;
+        const RANGE2: u32 = 8;
+        const RANGE3: u32 = 24;
+
+        const R1_START: u64 = 2;
+        const R1_END: u64 = mask(RANGE1) + R1_START;
+        const R2_START: u64 = R1_END + 1;
+        const R2_END: u64 = mask(RANGE2) + R2_START;
+        const R3_START: u64 = R2_END + 1;
+        const R3_END: u64 = mask(RANGE3) + R3_START;
+
+        let bits = match count {
+            0 => WordBits::empty(),
+            1 => WordBits::new(0b00 | (bit as usize) << 1, 2),
+            cnt @ R1_START..=R1_END => WordBits::new(mask_bit_len(0b001, bit, 2, cnt - R1_START, 3), 3 + RANGE1),
+            cnt @ R2_START..=R2_END => WordBits::new(mask_bit_len(0b0011, bit, 3, cnt - R2_START, 4), 4 + RANGE2),
+            cnt @ R3_START..=R3_END => WordBits::new(mask_bit_len(0b00111, bit, 4, cnt - R3_START, 5), 5 + RANGE3),
+            cnt => return (Self::compress_run_length(bit, R1_END as _).0, cnt as u64 - (R1_END as u64)),
+        };
+        (bits, 0)
+    }
+    pub fn decompress_run_length(self) -> Option<(bool, u64)> {
+        match (self.count, self.raw()) {
+            (0, _) => None,
+            (2, 0b00) => Some((false, 1)),
+            (2, 0b10) => Some((true, 1)),
+
+            _ => None,
+        }
     }
     // pub const fn last_set_bit(self) -> Option<u16> {
     //     let padding = Self::BITS - self.count;
@@ -1492,5 +1594,13 @@ mod tests {
         assert_eq!(iter.copy().next_unaligned_word(), WordBits::new(0x0100_0010_0010_0100, 64));
         assert_eq!(iter.next_word(), WordBits::new(0x0000_0010_0010_0100, 56));
         assert_eq!(iter.next_word(), WordBits::new(0x0000_0000_0000_0101, 10));
+    }
+
+    #[test]
+    fn test_bit_counts() {
+        let list = BitList::lit("000000000011111100000001011111100000001111111");
+        let val = list.iter().into_bit_counts().collect::<Vec<_>>();
+        println!("{val:?}, entropy: {}", list.iter().entropy());
+        assert_eq!(val, [(true, 7), (false, 7), (true, 6), (false, 1), (true, 1), (false, 7), (true, 6), (false, 10)]);
     }
 }

@@ -24,6 +24,9 @@ impl BitList {
     pub const FALSE: Self = InlineBitList::FALSE.to_list();
     pub const MAX_INLINE_BITS: usize = InlineBitList::MAX_INLINE_BITS as usize;
 
+    pub const fn new() -> Self {
+        Self::NO_BITS
+    }
     pub const fn try_inline(data: usize, count: usize) -> Option<Self> {
         if count <= Self::MAX_INLINE_BITS {
             let v = InlineBitList::new_masked(data, count as u32);
