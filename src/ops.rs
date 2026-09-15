@@ -1280,7 +1280,7 @@ mod tests {
         let list = BitList::from_le_bytes(&[123, 129, 0, 0, 0, 0, 0, 1, 3, 7]);
         println!("list: {list:?}");
         println!("First set bit: {:?}", list.next_set_bit(0));
-        let set = list.set_bit_indexes(0).collect::<Vec<_>>();
+        let set = list.bit_indexes(0, true).collect::<Vec<_>>();
         println!("Set bits: {:?}", set);
         assert_eq!(set.len(), list.count_ones());
     }
@@ -1299,7 +1299,7 @@ mod tests {
                 list.set(b, true);
             }
             let mut count = 0;
-            for b in list.set_bit_indexes(0) {
+            for b in list.bit_indexes(0, true) {
                 assert!(bits.contains(&b));
                 count += 1;
             }
@@ -1313,7 +1313,7 @@ mod tests {
         let mut a = BitList::from_le_bytes(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
         let b = BitList::from_le_bytes(&[1, 0, 0, 0, 0, 0, 0, 0, 0]);
         a.assign_add_overflow(&b);
-        assert_eq!(a.set_bit_indexes(0).collect::<Vec<_>>(), [71]);
+        assert_eq!(a.bit_indexes(0, true).collect::<Vec<_>>(), [71]);
 
         let rng = &mut StdRng::seed_from_u64(12345);
         for _ in 0..2000 {

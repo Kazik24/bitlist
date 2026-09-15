@@ -83,9 +83,10 @@ impl BitList {
         }
     }
 
-    pub fn set_bit_indexes(&self, start: usize) -> SetBitIndexes<'_> {
+    pub fn bit_indexes(&self, start: usize, value: bool) -> BitIndexes<'_> {
         let index = start.min(self.len());
-        SetBitIndexes { list: self, index }
+        let iter = self.range_iter_from(index);
+        BitIndexes { iter, index, value }
     }
 }
 
@@ -1155,17 +1156,46 @@ impl ExactSizeIterator for WordBitsIter<'_> {
 }
 
 #[derive(Clone)]
-pub struct SetBitIndexes<'a> {
-    list: &'a BitList,
+pub struct BitIndexes<'a> {
+    iter: BitsIter<'a>,
     index: usize,
+    value: bool,
 }
 
-impl Iterator for SetBitIndexes<'_> {
+impl Iterator for BitIndexes<'_> {
     type Item = usize;
     fn next(&mut self) -> Option<Self::Item> {
-        self.list.next_set_bit(self.index).inspect(|index| {
-            self.index = *index + 1;
-        })
+        self.const_next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.iter.len()))
+    }
+}
+impl BitIndexes<'_> {
+    pub fn const_next(&mut self) -> Option<usize> {
+        match self.iter.bit_position(self.value) {
+            Some(index) => {
+                let current = self.index + index;
+                self.index = current + 1;
+                Some(current)
+            }
+            None => None,
+        }
+    }
+    pub const fn change_bit(&mut self, value: bool) {
+        self.value = value;
+    }
+    pub const fn get_bit_value(&self) -> bool {
+        self.value
+    }
+    pub const fn advance_total_bits(&mut self, total_bits: usize) -> Result<(), NonZeroUsize> {
+        match self.iter.advance_by(total_bits) {
+            Ok(()) => {
+                self.index += total_bits;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
