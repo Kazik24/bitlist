@@ -588,6 +588,33 @@ impl<'a> BitsIter<'a> {
         self.const_next_back()
     }
 
+    pub fn is_equal(&self, other: &Self) -> bool {
+        let mut a = self.copy();
+        let mut b = other.copy();
+        if a.len() != b.len() {
+            return false;
+        }
+        if bit_in_word_index(a.start) == 0 && bit_in_word_index(b.start) == 0 {
+            // both starts are aligned, and same size
+            let arr = a.full_words();
+            if arr != b.full_words() {
+                return false;
+            }
+            _ = a.advance_by(arr.len() * HeapBitList::WORD_SIZE); // no checked_mut cause valid iterator has all bits in bounds
+            _ = b.advance_by(arr.len() * HeapBitList::WORD_SIZE);
+        }
+
+        /// normal iterators, todo optimize
+        debug_assert!(a.len() == b.len());
+        while let Some(av) = a.const_next() {
+            let bv = unsafe { b.const_next().unwrap_unchecked() };
+            if av != bv {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Find next continuous slot of 'size' bits all of same value, return offset of this slot from start
     /// and advances this iterator to the end of that slot.
     /// This function can be used e.g in memory allocators to find next free slot, equivalent to [`Self::find_continuous_slot_align`] with align=1
@@ -1075,6 +1102,13 @@ pub struct RawWordsIter<'a> {
     repr: Option<InlineBitList>,
     words: std::slice::Iter<'a, usize>,
 }
+
+impl PartialEq for BitsIter<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_equal(other)
+    }
+}
+impl Eq for BitsIter<'_> {}
 
 impl Iterator for RawWordsIter<'_> {
     type Item = usize;
