@@ -338,7 +338,7 @@ impl BitList {
         }
     }
 
-    pub fn format_decimal(&self) -> impl Display {
+    pub fn format_decimal(&self) -> impl Display + Debug {
         let list = self.unsigned_binary_to_bcd();
         let bcd = format!("{list:x}");
 
@@ -350,7 +350,7 @@ impl BitList {
                 s.push('0');
             }
         }
-        s
+        std::fmt::from_fn(move |f| write!(f, "{}", s))
     }
 
     pub fn resize(&mut self, new_len: usize, fill: Option<bool>) {
