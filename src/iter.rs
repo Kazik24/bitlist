@@ -343,12 +343,13 @@ impl<'a> BitsIter<'a> {
     }
 
     pub const fn to_inline_list(mut self) -> Option<InlineBitList> {
-        if self.len() > InlineBitList::MAX_INLINE_BITS as _ {
+        let len = self.len();
+        if len > InlineBitList::MAX_INLINE_BITS as _ {
             return None;
         }
-        let mut words = self.next_word();
-        words.push_bits(self.next_word());
-        words.try_inline()
+        let mut list = InlineBitList::new(0, len as _);
+        list.iter_mut().copy_from(self);
+        Some(list)
     }
 
     pub fn to_list(self) -> BitList {
@@ -735,6 +736,23 @@ impl<'a> BitsIter<'a> {
         }
     }
 
+    /// Split iterator so that self contains bit range [0..at) and returned iterator contains bit range [at..len)
+    /// Returns none if 'at' is out of bounds
+    pub const fn try_split_off(&mut self, at: usize) -> Option<Self> {
+        if at > (&*self).len() {
+            return None;
+        }
+        let Some(offset) = self.start.checked_add(at) else { return None };
+        let mut other = self.copy();
+        other.start = offset;
+        self.stop = offset;
+        Some(other)
+    }
+    /// Same as `try_split_off` but panics if 'at' is out of bounds
+    pub const fn split_off(&mut self, at: usize) -> Self {
+        self.try_split_off(at).expect("at is out of bounds")
+    }
+
     /// Copies all bits from this iterator to dst pointer, with bit offset of 'dst_bit_offset' into that pointer
     /// # Safety
     /// Caller must ensure that:
@@ -868,6 +886,16 @@ impl ExactSizeIterator for BitsIter<'_> {
     }
 }
 impl FusedIterator for BitsIter<'_> {}
+impl Default for BitsIter<'_> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+impl Default for BitsIterMut<'_> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
 #[derive(Copy, Clone, Eq)]
 pub struct WordBits {
@@ -1267,6 +1295,9 @@ pub struct BitsIterMut<'a> {
 }
 
 impl<'a> BitsIterMut<'a> {
+    pub fn empty() -> Self {
+        Self { inner: BitsIter::empty(), _phantom: PhantomData }
+    }
     pub const fn new_bounds(list: &'a mut BitList, start_bound: Bound<&usize>, end_bound: Bound<&usize>) -> Self {
         match list.inner_mut() {
             ReprMut::Inline(inl) => Self::from_inline_bounds(inl, start_bound, end_bound),
@@ -1375,6 +1406,17 @@ impl<'a> BitsIterMut<'a> {
     }
     pub const fn copy_to(self, dst: BitsIterMut<'_>) {
         self.to_const().copy_to(dst);
+    }
+
+    /// Split mutable iterator so that self contains bit range [0..at) and returned iterator contains bit range [at..len)
+    /// Returns none if 'at' is out of bounds
+    pub const fn try_split_off(&mut self, at: usize) -> Option<Self> {
+        let Some(rest) = self.inner.try_split_off(at) else { return None };
+        Some(Self { inner: rest, _phantom: PhantomData })
+    }
+    /// Same as `try_split_off` but panics if 'at' is out of bounds
+    pub const fn split_off(&mut self, at: usize) -> Self {
+        self.try_split_off(at).expect("at is out of bounds")
     }
 }
 
@@ -1666,5 +1708,35 @@ mod tests {
         let val = list.iter().into_bit_counts().collect::<Vec<_>>();
         println!("{val:?}, entropy: {}", list.iter().entropy());
         assert_eq!(val, [(true, 7), (false, 7), (true, 6), (false, 1), (true, 1), (false, 7), (true, 6), (false, 10)]);
+    }
+
+    #[test]
+    fn test_split_off() {
+        let mut a = BitsIter::from_words(&[0b0011000100001010000011100000], 2..28);
+        let mut b = a.try_split_off(10).unwrap();
+        assert_eq!(a.len(), 10);
+        assert_eq!(b.len(), 16);
+        assert_eq!(a.next_word(), WordBits::new(0b0000111000, 10));
+        assert_eq!(b.copy().next_word(), WordBits::new(0b0011000100001010, 16));
+        assert_eq!(b.try_split_off(17), None);
+        assert_eq!(b.copy().next_word(), WordBits::new(0b0011000100001010, 16));
+        let mut c = b.try_split_off(16).unwrap();
+        assert_eq!(b.len(), 16);
+        assert_eq!(c.len(), 0);
+        assert_eq!(b.copy().next_word(), WordBits::new(0b0011000100001010, 16));
+        assert_eq!(c.next_word(), WordBits::new(0, 0));
+    }
+
+    #[test]
+    fn test_split_off_mut() {
+        let mut buff = InlineBitList::new(0b0011000100001010000011100000, 28);
+        let mut a = BitsIterMut::from_inline(&mut buff, 2..28);
+        let mut b = a.try_split_off(10).unwrap();
+        assert_eq!(a.len(), 10);
+        let a = a.to_const().to_inline_list().unwrap();
+        assert_eq!(a, BitList::lit("0000111000").as_inline().cloned().unwrap());
+        assert_eq!(b.len(), 16);
+        let b = b.to_const().to_inline_list().unwrap();
+        assert_eq!(b, BitList::lit("0011000100001010").as_inline().cloned().unwrap());
     }
 }

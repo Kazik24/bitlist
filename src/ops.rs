@@ -1142,6 +1142,12 @@ impl Debug for BitList {
     }
 }
 
+impl Default for BitList {
+    fn default() -> Self {
+        BitList::NO_BITS
+    }
+}
+
 // impl Display for BitList {
 //     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
 //         if self.is_empty() {

@@ -1,8 +1,10 @@
 use crate::heap::{bit_in_word_index, is_invalid_index, is_invalid_range, set_bit_value};
 use crate::iter::WordBits;
 use crate::wrapper::BitList;
+use crate::{BitsIter, BitsIterMut};
+use std::fmt::{Debug, Formatter};
 use std::num::NonZeroUsize;
-use std::ops::Range;
+use std::ops::{Bound, Range};
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "align_16", repr(C, packed(2)))]
@@ -156,6 +158,18 @@ impl InlineBitList {
         let mask = mask.wrapping_shl(index as _);
         *self = InlineBitList::new((data & !mask) | value, len as _);
         true
+    }
+    pub const fn iter(&self) -> BitsIter<'_> {
+        BitsIter::from_inline_bounds(self, Bound::Unbounded, Bound::Unbounded)
+    }
+    pub const fn iter_mut(&mut self) -> BitsIterMut<'_> {
+        BitsIterMut::from_inline_bounds(self, Bound::Unbounded, Bound::Unbounded)
+    }
+}
+
+impl Debug for InlineBitList {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self.as_list(), f)
     }
 }
 
