@@ -300,6 +300,18 @@ impl BitList {
         self.range_iter_mut(range).fill(value);
     }
 
+    /// Replace specified range with another bits list, the range doesn't have to be the same size as the other bits list
+    pub fn insert(&mut self, range: Range<usize>, bits: BitsIter<'_>) {
+        //todo optimize
+        let tail = self.range_iter_from(range.end).to_list();
+        let total_size = range.start + bits.len() + tail.len();
+        self.resize(total_size, Some(false));
+        self.truncate(range.start);
+        self.push_bits(bits);
+        self.push_bits(tail.iter());
+        assert!(self.len() == total_size);
+    }
+
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), AllocateError> {
         match self.inner_mut() {
             ReprMut::Heap(v) => v.try_reserve(additional),
@@ -1525,5 +1537,16 @@ mod tests {
             bits[start..end].copy_from_slice(&to_set);
             assert!(main.iter().eq(bits.iter().copied()));
         }
+    }
+
+    #[test]
+    fn test_insert() {
+        let mut bits = BitList::NO_BITS;
+        bits.insert(0..0, BitList::lit("010100100").iter());
+        assert_eq!(bits, BitList::lit("010100100"));
+        bits.insert(3..5, BitList::lit("11000011").iter());
+        assert_eq!(bits, BitList::lit("010111000011100"));
+        bits.insert(0..0, BitList::lit("010").iter());
+        assert_eq!(bits, BitList::lit("010111000011100010"));
     }
 }
